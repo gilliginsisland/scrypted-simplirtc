@@ -1,0 +1,70 @@
+{
+   "name": "@gilliginsisland/scrypted-simplisafe",
+   "version": "0.0.1",
+   "description": "Native SimpliSafe camera plugin for Scrypted.",
+   "type": "commonjs",
+   "main": "out/main.nodejs.js",
+   "files": [
+      "out",
+      "README.md",
+      "LICENSE"
+   ],
+   "repository": {
+      "type": "git",
+      "url": "git+https://github.com/gilliginsisland/scrypted-simplisafe.git"
+   },
+   "bugs": {
+      "url": "https://github.com/gilliginsisland/scrypted-simplisafe/issues"
+   },
+   "homepage": "https://github.com/gilliginsisland/scrypted-simplisafe#readme",
+   "keywords": [
+      "scrypted",
+      "plugin",
+      "simplisafe",
+      "camera",
+      "webrtc"
+   ],
+   "license": "MIT",
+   "scripts": {
+      "scrypted-setup-project": "scrypted-setup-project",
+      "prescrypted-setup-project": "scrypted-package-json",
+      "build": "scrypted-webpack",
+      "preprepublishOnly": "scrypted-changelog",
+      "prepublishOnly": "NODE_ENV=production scrypted-webpack",
+      "prescrypted-vscode-launch": "scrypted-webpack",
+      "scrypted-vscode-launch": "scrypted-deploy-debug",
+      "scrypted-deploy-debug": "scrypted-deploy-debug",
+      "scrypted-debug": "scrypted-debug",
+      "scrypted-deploy": "scrypted-deploy",
+      "scrypted-changelog": "scrypted-changelog",
+      "scrypted-package-json": "scrypted-package-json",
+      "check": "tsc --noEmit",
+      "harness:auth-url": "tsx tools/discovery-harness.ts --auth-url",
+      "harness:discovery": "tsx tools/discovery-harness.ts",
+      "harness:live-view": "tsx tools/discovery-harness.ts --live-view",
+      "scrypted-readme": "scrypted-readme"
+   },
+   "scrypted": {
+      "name": "SimpliSafe Cameras",
+      "type": "DeviceProvider",
+      "interfaces": [
+         "DeviceProvider",
+         "Settings",
+         "Refresh"
+      ],
+      "pluginDependencies": [
+         "@scrypted/webrtc"
+      ]
+   },
+   "dependencies": {
+      "@livekit/protocol": "^1.46.6",
+      "@scrypted/sdk": "^0.3.61",
+      "ws": "^8.17.1"
+   },
+   "devDependencies": {
+      "@types/node": "^20.14.10",
+      "@types/ws": "^8.5.10",
+      "tsx": "^4.19.0",
+      "typescript": "^5.5.4"
+   }
+}
