@@ -1,4 +1,5 @@
 import crypto from 'crypto';
+import { z } from 'zod';
 
 const oauthBaseUrl = 'https://auth.simplisafe.com/oauth';
 const authorizeUrl = 'https://auth.simplisafe.com/authorize';
@@ -24,12 +25,17 @@ export interface SimpliSafeTokenStore {
     write(state: SimpliSafeTokenState): Promise<void> | void;
 }
 
-interface TokenResponse {
-    access_token: string;
-    refresh_token?: string;
-    token_type: string;
-    expires_in: number | string;
-}
+const tokenExpiresInSchema = z.union([
+    z.number().finite().positive(),
+    z.string().min(1).regex(/^\d+$/).transform(value => Number(value)),
+]);
+const tokenResponseSchema = z.looseObject({
+    access_token: z.string().min(1),
+    refresh_token: z.string().min(1).optional(),
+    token_type: z.string().min(1),
+    expires_in: tokenExpiresInSchema,
+});
+type TokenResponse = z.output<typeof tokenResponseSchema>;
 
 export class SimpliSafeAuth {
     private store: SimpliSafeTokenStore;
@@ -45,7 +51,7 @@ export class SimpliSafeAuth {
     async getAuthorizationUrl(): Promise<string> {
         const codeVerifier = await this.getOrCreateCodeVerifier();
         const deviceId = await this.getOrCreateDeviceId();
-        const codeChallenge = base64Url(sha256(codeVerifier));
+        const codeChallenge = base64Url(crypto.createHash('sha256').update(codeVerifier).digest());
         const url = new URL(authorizeUrl);
         url.searchParams.set('client_id', clientId);
         url.searchParams.set('scope', scope);
@@ -132,16 +138,12 @@ export class SimpliSafeAuth {
 
     private async storeToken(token: TokenResponse): Promise<void> {
         const previous = this.state;
-        const expiresIn = Number(token.expires_in);
-        if (!Number.isFinite(expiresIn) || expiresIn <= 0)
-            throw new Error(`Invalid token expiry from SimpliSafe: ${token.expires_in}`);
-
         await this.store.write({
             ...previous,
             accessToken: token.access_token,
             refreshToken: token.refresh_token ?? previous.refreshToken,
             tokenType: token.token_type || 'Bearer',
-            expiresAt: Date.now() + expiresIn * 1000,
+            expiresAt: Date.now() + token.expires_in * 1000,
         });
     }
 }
@@ -176,11 +178,7 @@ async function requestToken(body: Record<string, string>): Promise<TokenResponse
     if (!response.ok)
         throw new Error(`SimpliSafe token request failed: ${response.status} ${response.statusText}: ${text}`);
 
-    return JSON.parse(text) as TokenResponse;
-}
-
-function sha256(value: string): Buffer {
-    return crypto.createHash('sha256').update(value).digest();
+    return tokenResponseSchema.parse(JSON.parse(text));
 }
 
 function base64Url(value: Buffer): string {

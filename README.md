@@ -42,5 +42,3 @@ Fetch live-view metadata for discovered supported cameras:
 ```sh
 npm run harness:live-view
 ```
-
-Set `SIMPLISAFE_ACCOUNT_NUMBER` to restrict discovery to a specific account.

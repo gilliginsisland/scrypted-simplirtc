@@ -59,7 +59,8 @@
    "dependencies": {
       "@livekit/protocol": "^1.46.6",
       "@scrypted/sdk": "^0.3.61",
-      "ws": "^8.17.1"
+      "ws": "^8.17.1",
+      "zod": "^4.4.3"
    },
    "devDependencies": {
       "@types/node": "^20.14.10",

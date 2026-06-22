@@ -15,106 +15,47 @@ const liveKitProtocolVersion = '16';
 const liveKitSdk = 'python';
 const liveKitSdkVersion = '1.0.17';
 
-export interface LiveKitSignalingDetails {
-    liveKitURL: string;
-    userToken: string;
-}
-
-export interface LiveKitSignalingLogger {
-    debug(...args: unknown[]): void;
-    error(...args: unknown[]): void;
-}
-
-export interface LiveKitSignalingCloseEvent {
+export interface LiveKitSignalingCloseEvent extends Pick<ErrorEvent, 'message' | 'error'> {
     code: number;
     reason: string;
     requested: boolean;
-    message: string;
 }
 
 export interface LiveKitSignalingOptions {
-    cameraName: string;
-    logger: LiveKitSignalingLogger;
+    token: string;
+    protocol?: string | number;
+    sdk?: string;
+    sdkVersion?: string;
+    autoSubscribe?: boolean;
 }
 
 export class LiveKitSignaling extends EventEmitter {
-    private cameraName: string;
-    private logger: LiveKitSignalingLogger;
     private ws: WebSocket;
     private pingTimer?: NodeJS.Timeout;
     private closed = false;
-    private started = false;
     private messageChain: Promise<void> = Promise.resolve();
-    private deferredClose?: LiveKitSignalingCloseEvent;
-    private deferredWebSocketError?: Error;
 
-    private constructor(options: LiveKitSignalingOptions, ws: WebSocket) {
+    constructor(liveKitURL: string, options: LiveKitSignalingOptions) {
         super();
-        this.cameraName = options.cameraName;
-        this.logger = options.logger;
-        this.ws = ws;
+        this.ws = new WebSocket(createLiveKitEndpoint(liveKitURL, options));
 
-        ws.on('close', (code, reason) => {
+        this.ws.on('close', (code, reason) => {
             this.clearPing();
             const requested = this.closed;
             this.closed = true;
             const reasonText = reason.toString();
+            const message = `LiveKit signaling closed: code=${code} reason=${reasonText}`;
             const event: LiveKitSignalingCloseEvent = {
                 code,
                 reason: reasonText,
                 requested,
-                message: `LiveKit signaling closed for ${this.cameraName}: code=${code} reason=${reasonText}`,
+                message,
+                error: new Error(message),
             };
-            if (this.started)
-                this.emitEventLater('close', event);
-            else
-                this.deferredClose = event;
-        });
-        ws.on('error', e => {
-            if (this.started)
-                this.emitEventLater('websocketError', e);
-            else
-                this.deferredWebSocketError = e;
-        });
-    }
-
-    static async connect(options: LiveKitSignalingOptions, details: LiveKitSignalingDetails): Promise<LiveKitSignaling> {
-        const endpoint = createLiveKitEndpoint(details.liveKitURL, details.userToken);
-        const ws = new WebSocket(endpoint);
-        const signaling = new LiveKitSignaling(options, ws);
-
-        try {
-            await waitForWebSocketOpen(ws);
-        }
-        catch (e) {
-            await signaling.close();
-            throw e;
-        }
-        return signaling;
-    }
-
-    start(): void {
-        if (this.started)
-            throw new Error(`LiveKit signaling already started for ${this.cameraName}.`);
-
-        this.started = true;
-        const ws = this.ws;
-        ws.on('message', data => {
-            this.messageChain = this.messageChain
-                .then(() => this.handleMessage(data))
-                .catch(e => this.notifyError(e));
-        });
-
-        if (this.deferredWebSocketError) {
-            const error = this.deferredWebSocketError;
-            this.deferredWebSocketError = undefined;
-            this.emitEventLater('websocketError', error);
-        }
-        if (this.deferredClose) {
-            const event = this.deferredClose;
-            this.deferredClose = undefined;
             this.emitEventLater('close', event);
-        }
+        });
+        this.ws.on('error', e => this.emitEventLater('error', e));
+        this.ws.on('message', data => this.enqueueMessage(data));
     }
 
     async close(): Promise<void> {
@@ -152,7 +93,7 @@ export class LiveKitSignaling extends EventEmitter {
         }));
     }
 
-    private async handleMessage(data: RawData): Promise<void> {
+    private async onMessage(data: RawData): Promise<void> {
         const response = SignalResponse.fromBinary(rawDataToBytes(data));
         const message = response.message;
 
@@ -182,12 +123,16 @@ export class LiveKitSignaling extends EventEmitter {
             case 'subscriptionResponse':
             case 'mediaSectionsRequirement':
             case 'subscribedAudioCodecUpdate':
-                this.logger.debug(`Ignoring LiveKit signaling message kind=${message.case} for ${this.cameraName}.`);
                 break;
             default:
-                this.logger.debug(`Ignoring unsupported LiveKit signaling message kind=${message.case ?? 'missing'} for ${this.cameraName}.`);
                 break;
         }
+    }
+
+    private enqueueMessage(data: RawData): void {
+        this.messageChain = this.messageChain
+            .then(() => this.onMessage(data))
+            .catch(e => this.notifyError(e));
     }
 
     private startPing(join: JoinResponse): void {
@@ -208,10 +153,8 @@ export class LiveKitSignaling extends EventEmitter {
     }
 
     private sendRequest(request: SignalRequest): void {
-        if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
-            this.logger.debug(`Dropping LiveKit signaling request after websocket close for ${this.cameraName}.`);
+        if (!this.ws || this.ws.readyState !== WebSocket.OPEN)
             return;
-        }
         this.ws.send(Buffer.from(request.toBinary()));
     }
 
@@ -228,34 +171,37 @@ export class LiveKitSignaling extends EventEmitter {
 
     private emitEventLater(eventName: string, ...args: unknown[]): void {
         this.emitEvent(eventName, ...args)
-            .catch(e => this.logger.error(`LiveKit signaling event handler failed for ${this.cameraName}.`, e));
+            .catch(e => {
+                if (eventName !== 'error')
+                    this.emitEventLater('error', e);
+            });
     }
 
     private async emitEvent(eventName: string, ...args: unknown[]): Promise<void> {
-        const listeners = this.listeners(eventName);
-        if (!listeners.length) {
-            if (eventName === 'error')
-                this.logger.error(`Unhandled LiveKit signaling error for ${this.cameraName}.`, args[0]);
+        const listeners = this.rawListeners(eventName);
+        if (!listeners.length)
             return;
-        }
 
         for (const listener of listeners)
             await (listener as (...args: unknown[]) => void | Promise<void>)(...args);
     }
 }
 
-function createLiveKitEndpoint(liveKitURL: string, userToken: string): string {
-    const endpoint = new URL('rtc', ensureTrailingSlash(liveKitURL));
-    endpoint.searchParams.set('access_token', userToken);
-    endpoint.searchParams.set('sdk', liveKitSdk);
-    endpoint.searchParams.set('version', liveKitSdkVersion);
-    endpoint.searchParams.set('protocol', liveKitProtocolVersion);
-    endpoint.searchParams.set('auto_subscribe', '1');
+function createLiveKitEndpoint(liveKitURL: string, options: LiveKitSignalingOptions): string {
+    const {
+        token,
+        protocol = liveKitProtocolVersion,
+        sdk = liveKitSdk,
+        sdkVersion = liveKitSdkVersion,
+        autoSubscribe = true,
+    } = options;
+    const endpoint = new URL('rtc', liveKitURL.endsWith('/') ? liveKitURL : `${liveKitURL}/`);
+    endpoint.searchParams.set('access_token', token);
+    endpoint.searchParams.set('sdk', sdk);
+    endpoint.searchParams.set('version', sdkVersion);
+    endpoint.searchParams.set('protocol', protocol.toString());
+    endpoint.searchParams.set('auto_subscribe', autoSubscribe ? '1' : '0');
     return endpoint.toString();
-}
-
-function ensureTrailingSlash(value: string): string {
-    return value.endsWith('/') ? value : `${value}/`;
 }
 
 function rawDataToBytes(data: RawData): Uint8Array {
@@ -266,32 +212,4 @@ function rawDataToBytes(data: RawData): Uint8Array {
     if (Array.isArray(data))
         return Buffer.concat(data);
     return new Uint8Array(data);
-}
-
-function waitForWebSocketOpen(ws: WebSocket): Promise<void> {
-    if (ws.readyState === WebSocket.OPEN)
-        return Promise.resolve();
-
-    return new Promise((resolve, reject) => {
-        const cleanup = () => {
-            ws.off('open', onOpen);
-            ws.off('error', onError);
-            ws.off('close', onClose);
-        };
-        const onOpen = () => {
-            cleanup();
-            resolve();
-        };
-        const onError = (e: Error) => {
-            cleanup();
-            reject(e);
-        };
-        const onClose = (code: number, reason: Buffer) => {
-            cleanup();
-            reject(new Error(`LiveKit websocket closed before open: code=${code} reason=${reason.toString()}`));
-        };
-        ws.once('open', onOpen);
-        ws.once('error', onError);
-        ws.once('close', onClose);
-    });
 }

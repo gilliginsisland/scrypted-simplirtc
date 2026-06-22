@@ -1,9 +1,10 @@
 import sdk, { Device, DeviceProvider, Refresh, ScryptedDeviceBase, ScryptedDeviceType, ScryptedInterface, Setting, Settings, SettingValue } from '@scrypted/sdk';
 import { StorageSettings } from '@scrypted/sdk/storage-settings';
-import { KinesisSimpliSafeCameraDevice, LiveKitSimpliSafeCameraDevice, SimpliSafeCameraDevice } from './camera';
+import { SimpliSafeCameraDevice } from './camera';
 import { SimpliSafeApi } from './simplisafe/api';
+import type { SimpliSafeCamera } from './simplisafe/camera';
 import { SimpliSafeAuth, SimpliSafeTokenState, SimpliSafeTokenStore } from './simplisafe/oauth';
-import { DiscoveredSimpliSafeCamera, SimpliSafeRealtimeEvent } from './simplisafe/types';
+import { SimpliSafeRealtimeEvents, SimpliSafeRealtimeWatchdog } from './simplisafe/realtime';
 
 const { deviceManager } = sdk;
 
@@ -35,14 +36,17 @@ class StorageTokenStore implements SimpliSafeTokenStore {
 }
 
 export default class SimpliSafePlugin extends ScryptedDeviceBase implements DeviceProvider, Settings, Refresh {
-    private cameras = new Map<string, DiscoveredSimpliSafeCamera>();
+    private cameras = new Map<string, SimpliSafeCamera>();
     private devices = new Map<string, SimpliSafeCameraDevice>();
+    private refreshPromise?: Promise<void>;
+    private realtimeEvents = new SimpliSafeRealtimeEvents();
+    private realtimeWatchdog = new SimpliSafeRealtimeWatchdog(this.realtimeEvents, async () => {
+        const userId = await this.api.getUserId();
+        const accessToken = await this.auth.ensureAccessToken();
+        return { accessToken, userId };
+    });
 
     settingsStorage = new StorageSettings(this, {
-        accountNumber: {
-            title: 'Account Number',
-            description: 'Optional: restrict discovery to one SimpliSafe account number.',
-        },
         redirectUrl: {
             title: 'Redirect URL',
             description: 'Paste the final SimpliSafe mobile redirect URL here after opening the Login URL.',
@@ -54,7 +58,7 @@ export default class SimpliSafePlugin extends ScryptedDeviceBase implements Devi
                     return;
                 await this.auth.exchangeRedirectUrl(redirectUrl);
                 this.log.a('SimpliSafe login completed.');
-                await this.discoverDevices();
+                await this.refresh(ScryptedInterface.DeviceProvider, false);
             },
         },
         accessToken: {
@@ -82,33 +86,14 @@ export default class SimpliSafePlugin extends ScryptedDeviceBase implements Devi
             title: 'OAuth Device ID',
             hide: true,
         },
-        debug: {
-            title: 'Debug Logging',
-            type: 'boolean',
-            defaultValue: false,
-        },
     });
 
     auth = new SimpliSafeAuth(new StorageTokenStore(this.settingsStorage));
-    api = new SimpliSafeApi(this.auth, {
-        accountNumber: asString(this.settingsStorage.values.accountNumber),
-        logger: this.console,
-    });
+    api = new SimpliSafeApi(this.auth);
 
     constructor(nativeId?: string) {
         super(nativeId);
-        this.api.addCameraMotionListener(event => {
-            this.handleCameraMotionEvent(event).catch(e => this.console.error('Failed to route SimpliSafe camera motion event.', e));
-        });
-        this.startup().catch(e => this.console.error('SimpliSafe discovery failed.', e));
-    }
-
-    private async startup(): Promise<void> {
-        if (!this.auth.state.refreshToken) {
-            this.log.a('Open the SimpliSafe Login URL setting, approve access, then paste the final redirect URL.');
-            return;
-        }
-        await this.discoverDevices();
+        this.refresh(ScryptedInterface.DeviceProvider, false).catch(e => this.console.error('SimpliSafe refresh failed.', e));
     }
 
     async getSettings(): Promise<Setting[]> {
@@ -127,99 +112,85 @@ export default class SimpliSafePlugin extends ScryptedDeviceBase implements Devi
 
     async putSetting(key: string, value: SettingValue): Promise<void> {
         await this.settingsStorage.putSetting(key, value);
-        if (key === 'accountNumber')
-            await this.discoverDevices();
     }
 
     async refresh(refreshInterface: string, userInitiated: boolean): Promise<void> {
-        this.console.log(`Refreshing SimpliSafe devices: interface=${refreshInterface} userInitiated=${userInitiated}`);
-        await this.discoverDevices();
+        if (this.refreshPromise)
+            return this.refreshPromise;
+
+        this.refreshPromise = (async () => {
+            if (!this.auth.state.refreshToken) {
+                this.log.a('Open the SimpliSafe Login URL setting, approve access, then paste the final redirect URL.');
+                return;
+            }
+
+            this.console.log(`Refreshing SimpliSafe devices: interface=${refreshInterface} userInitiated=${userInitiated}`);
+            await this.api.update();
+
+            const cameras = new Map<string, SimpliSafeCamera>();
+            for (const subscription of this.api.getSubscriptions()) {
+                for (const camera of subscription.getCameras()) {
+                    const nativeId = `${camera.systemId}:${camera.serial}`;
+                    cameras.set(nativeId, camera);
+                }
+            }
+            this.cameras = cameras;
+
+            const devices: Device[] = Array.from(this.cameras.entries()).map(([nativeId, camera]) => {
+                return {
+                    nativeId,
+                    name: camera.name,
+                    type: ScryptedDeviceType.Camera,
+                    interfaces: [
+                        ScryptedInterface.MotionSensor,
+                        ScryptedInterface.RTCSignalingChannel,
+                    ],
+                    info: {
+                        manufacturer: 'SimpliSafe',
+                        model: camera.model ?? camera.backend,
+                        firmware: camera.firmware,
+                        serialNumber: camera.serial,
+                    },
+                };
+            });
+
+            await deviceManager.onDevicesChanged({ devices });
+            this.console.log(`Discovered ${devices.length} supported SimpliSafe camera(s).`);
+        })().finally(() => this.refreshPromise = undefined);
+
+        return this.refreshPromise;
     }
 
     async getRefreshFrequency(): Promise<number> {
         return 300;
     }
 
-    async discoverDevices(): Promise<void> {
-        this.api.setOptions({
-            accountNumber: asString(this.settingsStorage.values.accountNumber),
-            logger: this.console,
-        });
-
-        const cameras = await this.api.discoverCameras();
-        this.cameras.clear();
-
-        const devices: Device[] = cameras.map(camera => {
-            this.cameras.set(camera.nativeId, camera);
-            return {
-                nativeId: camera.nativeId,
-                name: camera.name,
-                type: ScryptedDeviceType.Camera,
-                interfaces: [
-                    ScryptedInterface.MotionSensor,
-                    ScryptedInterface.RTCSignalingChannel,
-                ],
-                info: {
-                    manufacturer: 'SimpliSafe',
-                    model: camera.model ?? camera.backend,
-                    firmware: camera.firmware,
-                    serialNumber: camera.serial,
-                },
-            };
-        });
-
-        await deviceManager.onDevicesChanged({ devices });
-        this.console.log(`Discovered ${devices.length} supported SimpliSafe camera(s).`);
-        if (devices.length)
-            await this.api.startRealtimeEvents();
-        else
-            this.api.stopRealtimeEvents();
-    }
-
     async getDevice(nativeId: string): Promise<SimpliSafeCameraDevice> {
-        let camera = this.cameras.get(nativeId);
-        if (!camera) {
-            await this.discoverDevices();
-            camera = this.cameras.get(nativeId);
+        if (!this.devices.has(nativeId)) {
+            const camera = this.cameras.get(nativeId);
+            if (!camera)
+                throw new Error(`Unknown SimpliSafe camera nativeId=${nativeId}.`);
+            this.devices.set(nativeId, new SimpliSafeCameraDevice(this.api, this.realtimeEvents, nativeId, camera));
+            await this.syncRealtimeWatchdog();
         }
-        if (!camera)
-            throw new Error(`Unknown SimpliSafe camera nativeId=${nativeId}`);
-
-        let device = this.devices.get(nativeId);
-        if (!device || device.camera !== camera) {
-            switch (camera.backend) {
-                case 'kvs':
-                    device = new KinesisSimpliSafeCameraDevice(this, nativeId, camera);
-                    break;
-                case 'mist':
-                    device = new LiveKitSimpliSafeCameraDevice(this, nativeId, camera);
-                    break;
-                default:
-                    throw new Error(`Camera '${camera.name}' has unsupported SimpliSafe WebRTC provider '${camera.backend}'.`);
-            }
-            this.devices.set(nativeId, device);
-        }
-        return device;
+        return this.devices.get(nativeId)!;
     }
 
     async releaseDevice(_id: string, nativeId: string): Promise<void> {
-        this.devices.get(nativeId)?.clearMotion();
+        const device = this.devices.get(nativeId);
+        if (!device)
+            return
+
+        device.release();
         this.devices.delete(nativeId);
+        await this.syncRealtimeWatchdog();
     }
 
-    private async handleCameraMotionEvent(event: SimpliSafeRealtimeEvent): Promise<void> {
-        let matched = false;
-        for (const camera of this.cameras.values()) {
-            if (!cameraMatchesMotionEvent(camera, event))
-                continue;
-
-            matched = true;
-            const device = await this.getDevice(camera.nativeId);
-            device.handleMotionEvent(event);
-        }
-
-        if (!matched)
-            this.console.debug(`Ignoring SimpliSafe camera motion event for unmatched sensor serial '${event.sensorSerial ?? 'missing'}'.`);
+    private async syncRealtimeWatchdog(): Promise<void> {
+        if (this.realtimeEvents.hasListeners())
+            await this.realtimeWatchdog.start();
+        else
+            this.realtimeWatchdog.stop();
     }
 }
 
@@ -236,10 +207,4 @@ function asNumber(value: unknown): number | undefined {
             return parsed;
     }
     return undefined;
-}
-
-function cameraMatchesMotionEvent(camera: DiscoveredSimpliSafeCamera, event: SimpliSafeRealtimeEvent): boolean {
-    if (event.systemId && event.systemId !== camera.systemId)
-        return false;
-    return !!event.sensorSerial && camera.eventSerials.includes(event.sensorSerial);
 }

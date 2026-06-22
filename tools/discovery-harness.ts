@@ -1,9 +1,9 @@
 import fs from 'fs';
 import path from 'path';
 import { SimpliSafeApi } from '../src/simplisafe/api';
+import type { SimpliSafeCamera, SimpliSafeLiveViewDetails } from '../src/simplisafe/camera';
 import { SimpliSafeAuth } from '../src/simplisafe/oauth';
 import type { SimpliSafeTokenState, SimpliSafeTokenStore } from '../src/simplisafe/oauth';
-import type { DiscoveredSimpliSafeCamera } from '../src/simplisafe/types';
 
 const defaultAccessTokenTtlMs = 30 * 60 * 1000;
 
@@ -47,14 +47,15 @@ async function main(): Promise<void> {
         console.log(`Stored SimpliSafe tokens in ${tokenFile}`);
     }
 
-    const api = new SimpliSafeApi(auth, {
-        accountNumber: process.env.SIMPLISAFE_ACCOUNT_NUMBER,
-        logger: console,
-    });
+    const api = new SimpliSafeApi(auth);
+    await api.update();
 
-    const cameras = await api.discoverCameras();
+    const cameras: SimpliSafeCamera[] = [];
+    for (const subscription of api.getSubscriptions()) {
+        for (const camera of subscription.getCameras())
+            cameras.push(camera);
+    }
     console.log(JSON.stringify(cameras.map(camera => ({
-        nativeId: camera.nativeId,
         name: camera.name,
         serial: camera.serial,
         eventSerials: camera.eventSerials,
@@ -70,11 +71,11 @@ async function main(): Promise<void> {
         return;
 
     for (const camera of cameras) {
-        const liveView = await api.getLiveView(camera);
+        const liveView = await camera.getLiveView();
         console.log(JSON.stringify({
             camera: camera.name,
             serial: camera.serial,
-            ...summarizeLiveView(camera, liveView),
+            ...summarizeLiveView(liveView),
         }, null, 2));
     }
 }
@@ -114,6 +115,10 @@ function summarizeCameraOptions(rawCamera: unknown): Record<string, unknown> {
             fps: admin.fps,
             bitRate: admin.bitRate,
         },
+        video: {
+            supportedResolutions: cameraSettings.supportedResolutions,
+            featureResolutions: supportedFeatures.resolutions,
+        },
         supportedFeatures: {
             providers,
             privacyShutter: supportedFeatures.privacyShutter,
@@ -123,31 +128,24 @@ function summarizeCameraOptions(rawCamera: unknown): Record<string, unknown> {
     };
 }
 
-function summarizeLiveView(camera: DiscoveredSimpliSafeCamera, liveView: unknown): Record<string, unknown> {
-    const object = recordValue(liveView) ?? {};
-    switch (camera.backend) {
+function summarizeLiveView(liveView: SimpliSafeLiveViewDetails): Record<string, unknown> {
+    switch (liveView.backend) {
         case 'kvs':
             return {
                 provider: 'kvs',
-                hasSignedChannelEndpoint: typeof object.signedChannelEndpoint === 'string' && !!object.signedChannelEndpoint,
-                clientId: stringValue(object.clientId),
-                iceServerCount: Array.isArray(object.iceServers) ? object.iceServers.length : 0,
+                hasSignedChannelEndpoint: !!liveView.signedChannelEndpoint,
+                clientId: liveView.clientId,
+                iceServerCount: liveView.iceServers.length,
             };
-        case 'mist': {
-            const details = recordValue(object.liveKitDetails) ?? {};
-            const token = stringValue(details.userToken);
+        case 'mist':
             return {
                 provider: 'mist',
-                liveKitURL: stringValue(details.liveKitURL),
-                hasUserToken: !!token,
-                userTokenExpiresAt: decodeJwtExpiry(token),
+                liveKitURL: liveView.liveKitURL,
+                hasUserToken: !!liveView.userToken,
+                userTokenExpiresAt: decodeJwtExpiry(liveView.userToken),
             };
-        }
         default:
-            return {
-                provider: camera.backend,
-                rawKeys: Object.keys(object).sort(),
-            };
+            return assertNever(liveView, 'Unsupported SimpliSafe live-view backend.');
     }
 }
 
@@ -173,14 +171,6 @@ function assertOptionalRecord(value: unknown, label: string): Record<string, unk
     return assertRecord(value, label);
 }
 
-function recordValue(value: unknown): Record<string, unknown> | undefined {
-    return value && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : undefined;
-}
-
-function stringValue(value: unknown): string | undefined {
-    return typeof value === 'string' && value ? value : undefined;
-}
-
 function firstDefined<T>(...values: T[]): T | undefined {
     return values.find(value => value !== undefined && value !== null);
 }
@@ -200,6 +190,11 @@ function decodeJwtExpiry(token: string | undefined): string | undefined {
     catch {
         return;
     }
+}
+
+function assertNever(value: never, message: string): never {
+    void value;
+    throw new Error(message);
 }
 
 main().catch(e => {

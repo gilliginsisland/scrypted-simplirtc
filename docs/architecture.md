@@ -8,19 +8,21 @@ to browser clients and provide the downstream `VideoCamera` mixin surface.
 
 This plugin should register each SimpliSafe camera as:
 
+- `VideoCamera` to publish stream metadata such as H264.
 - `RTCSignalingChannel` for native WebRTC session ownership.
 - `MotionSensor` for SimpliSafe camera motion events.
 
-It should not implement `VideoCamera` directly. Scrypted's WebRTC plugin mixin
-adds that surface for camera devices that expose `RTCSignalingChannel`, matching
-the Ring plugin pattern.
+The Scrypted WebRTC plugin mixin can also add a `VideoCamera` surface for
+devices that expose `RTCSignalingChannel`, matching the Ring plugin pattern.
+SimpliSafe keeps a direct `VideoCamera` implementation so the plugin can report
+camera-specific stream metadata that the generic WebRTC mixin does not know.
 
-## Video Dimensions
+## Video Presentation
 
 SimpliSafe camera frames are not guaranteed to use a standard 16:9 resolution.
-Do not hardcode width or height constants in this plugin. The direct WebRTC path
-should preserve the producer SDP and let the browser/Scrypted WebRTC layer learn
-the actual video dimensions from the media track.
+Do not hardcode presentation dimensions in this plugin. The direct WebRTC path
+should preserve the producer SDP so the browser/Scrypted WebRTC layer can learn
+the actual media track dimensions.
 
 The SimpliSafe LiveKit path should preserve the producer SDP and encoded H264
 packets without SDP munging that strips SPS/PPS or otherwise forces an assumed
