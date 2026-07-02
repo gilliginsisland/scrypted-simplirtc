@@ -5,10 +5,11 @@ import {
     RTCSignalingSession,
 } from '@scrypted/sdk';
 import { SimpliSafeDevice } from './device';
+import { KVSRTCSignalingSession } from './media/kvs-rtc-signaling-session';
 import { LiveKitRTCSessionControl } from './media/livekit-rtc-session-control';
-import { LiveKitSignaling } from './media/livekit-signaling';
+import { connectRTCSignalingClients } from './media/rtc-signaling';
 import type { SimpliSafeApi } from './simplisafe/api';
-import type { KinesisLiveViewDetails, LiveKitLiveViewDetails, SimpliSafeCamera } from './simplisafe/camera';
+import type { KVSLiveViewDetails, LiveKitLiveViewDetails, SimpliSafeCamera } from './simplisafe/camera';
 import type { SimpliSafeRealtimeEvent, SimpliSafeRealtimeEvents } from './simplisafe/realtime';
 
 const motionHoldMs = 30_000;
@@ -46,10 +47,24 @@ export class SimpliSafeCameraDevice extends SimpliSafeDevice implements RTCSigna
     async startRTCSignalingSession(session: RTCSignalingSession): Promise<RTCSessionControl> {
         const liveView = await this.camera.getLiveView();
         switch (liveView.backend) {
-            case 'kvs':
-                return startKinesisRTCSignalingSession(this, session, liveView);
+            case 'kvs': {
+                const kvsSession = new KVSRTCSignalingSession(liveView);
+                void connectRTCSignalingClients(session, {
+                    configuration: {
+                        iceServers: liveView.iceServers,
+                    },
+                    audio: {
+                        direction: 'sendrecv',
+                    },
+                    video: {
+                        direction: 'recvonly',
+                    },
+                    getUserMediaSafariHack: true,
+                }, kvsSession, {}).catch(() => kvsSession.endSession());
+                return kvsSession;
+            }
             case 'mist':
-                return startLiveKitRTCSignalingSession(session, liveView);
+                return LiveKitRTCSessionControl.start(liveView.liveKitURL, liveView.userToken, session);
             default:
                 throw new Error('Unsupported SimpliSafe live-view backend.');
         }
@@ -59,21 +74,4 @@ export class SimpliSafeCameraDevice extends SimpliSafeDevice implements RTCSigna
         super.release();
         this.clearMotion();
     }
-}
-
-async function startKinesisRTCSignalingSession(device: SimpliSafeCameraDevice, _session: RTCSignalingSession, _liveView: KinesisLiveViewDetails): Promise<RTCSessionControl> {
-    throw new Error(`SimpliSafe Kinesis WebRTC streaming is not implemented for '${device.camera.name}'.`);
-}
-
-async function startLiveKitRTCSignalingSession(session: RTCSignalingSession, liveView: LiveKitLiveViewDetails): Promise<RTCSessionControl> {
-    const signaling = new LiveKitSignaling(liveView.liveKitURL, { token: liveView.userToken });
-    const control = new LiveKitRTCSessionControl(signaling);
-    try {
-        await control.start(session);
-    }
-    catch (e) {
-        await control.endSession();
-        throw e;
-    }
-    return control;
 }

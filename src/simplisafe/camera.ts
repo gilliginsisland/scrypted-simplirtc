@@ -24,9 +24,9 @@ export interface SimpliSafeCameraApi {
     getLiveView(camera: Pick<SimpliSafeCameraDetails, 'serial' | 'systemId'>): Promise<unknown>;
 }
 
-export type SimpliSafeLiveViewDetails = KinesisLiveViewDetails | LiveKitLiveViewDetails;
+export type SimpliSafeLiveViewDetails = KVSLiveViewDetails | LiveKitLiveViewDetails;
 
-export interface KinesisLiveViewDetails {
+export interface KVSLiveViewDetails {
     backend: 'kvs';
     signedChannelEndpoint: string;
     clientId: string;
@@ -72,7 +72,7 @@ export class SimpliSafeCamera {
         const liveView = await this.api.getLiveView(this);
         switch (this.backend) {
             case 'kvs':
-                return parseKinesisLiveView(liveView);
+                return parseKVSLiveView(liveView);
             case 'mist':
                 return parseLiveKitLiveView(liveView);
             default:
@@ -90,7 +90,7 @@ const iceServerSchema = z.looseObject({
     username: z.string().min(1).optional(),
     credential: z.string().min(1).optional(),
 });
-const kinesisLiveViewSchema = z.looseObject({
+const kvsLiveViewSchema = z.looseObject({
     signedChannelEndpoint: z.string().min(1),
     clientId: z.string().min(1),
     iceServers: z.array(iceServerSchema).min(1),
@@ -102,8 +102,8 @@ const liveKitLiveViewSchema = z.looseObject({
     }),
 });
 
-function parseKinesisLiveView(liveView: unknown): KinesisLiveViewDetails {
-    const liveViewDetails = kinesisLiveViewSchema.parse(liveView);
+function parseKVSLiveView(liveView: unknown): KVSLiveViewDetails {
+    const liveViewDetails = kvsLiveViewSchema.parse(liveView);
 
     return {
         backend: 'kvs',

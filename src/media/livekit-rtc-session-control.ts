@@ -1,53 +1,98 @@
-import { JoinResponse, SessionDescription, SignalTarget, TrickleRequest } from '@livekit/protocol';
-import type {
-    RTCAVSignalingSetup,
-    RTCSessionControl,
-    RTCSignalingOptions,
-    RTCSignalingSendIceCandidate,
-    RTCSignalingSession,
-} from '@scrypted/sdk';
+import {
+    ClientInfo,
+    ClientInfo_SDK,
+    ConnectionSettings,
+    JoinRequest,
+    JoinResponse,
+    ParticipantInfo,
+    ParticipantUpdate,
+    SessionDescription,
+    SignalTarget,
+    StreamState,
+    StreamStateUpdate,
+    SubscriptionResponse,
+    TrackInfo,
+    TrackSubscribed,
+    TrackType,
+    TrickleRequest,
+    UpdateSubscription,
+    WrappedJoinRequest,
+    WrappedJoinRequest_Compression,
+} from '@livekit/protocol';
+import { RTCAVSignalingSetup, RTCSessionControl, RTCSignalingOptions, RTCSignalingSession } from '@scrypted/sdk';
+import { gzipSync } from 'zlib';
 import { LiveKitSignaling, LiveKitSignalingCloseEvent } from './livekit-signaling';
 
-export class LiveKitRTCSessionControl implements RTCSessionControl {
-    private iceConfiguration = new Future<RTCConfiguration>();
-    private offers = new AsyncQueue<PendingOffer>();
-    private remoteCandidates = new IceCandidateQueue();
-    private audioVideoReady = new Future<void>();
-    private disableTrickle = false;
-    private started = false;
-    private ended = false;
+const liveKitProtocolVersion = 16;
+const liveKitSdkVersion = '1.0.17';
 
-    constructor(private signaling: LiveKitSignaling) {
-        this.signaling.once('join', (join: JoinResponse) => {
-            this.iceConfiguration.resolve({
-                iceServers: join.iceServers.map(server => ({
-                    urls: server.urls,
-                    username: server.username || undefined,
-                    credential: server.credential || undefined,
-                })),
-            });
-        });
-        this.signaling.on('offer', (offer: SessionDescription) => this.onOffer(offer));
-        this.signaling.on('trickle', (trickle: TrickleRequest) => this.onTrickle(trickle));
-        this.signaling.on('leave', () => this.onLeave());
-        this.signaling.on('close', (event: LiveKitSignalingCloseEvent) => this.onClose(event));
+export class LiveKitRTCSessionControl implements RTCSessionControl {
+    private readonly joined = new Future<JoinResponse>();
+    private readonly pendingAnswers = new Map<number, Future<SessionDescription>>();
+    private readonly mediaReady = new Future<void>();
+    private readonly remoteCandidates: RTCIceCandidateInit[] = [];
+    private readonly subscribedTrackSids = new Set<string>();
+    private readonly trackKindsBySid = new Map<string, TrackType>();
+    private readonly activeTrackSids = new Set<string>();
+    private readonly subscribedReadyTrackSids = new Set<string>();
+    private renegotiation: Promise<void> = Promise.resolve();
+    private nextOfferId = 2;
+    private ownParticipantSid?: string;
+    private remoteDescriptionSet = false;
+    private closed = false;
+
+    private constructor(
+        private readonly signaling: LiveKitSignaling,
+        private readonly session: RTCSignalingSession,
+        private readonly setup: RTCAVSignalingSetup,
+        private readonly localCandidates: IceCandidateQueue,
+        private readonly trickleCandidates: boolean,
+    ) {
+        this.localCandidates.setSender(candidate => this.signaling.sendIceCandidate(candidate, SignalTarget.PUBLISHER));
+
+        this.signaling.on('join', join => this.onJoin(join));
+        this.signaling.on('answer', answer => this.onAnswer(answer));
+        this.signaling.on('trickle', trickle => this.onTrickle(trickle));
+        this.signaling.on('update', update => this.onUpdate(update));
+        this.signaling.on('trackSubscribed', track => this.onTrackSubscribed(track));
+        this.signaling.on('streamStateUpdate', update => this.onStreamStateUpdate(update));
+        this.signaling.on('subscriptionResponse', response => this.onSubscriptionResponse(response));
+        this.signaling.on('mediaSectionsRequirement', () => this.onMediaSectionsRequirement());
+        this.signaling.on('leave', () => this.endSession());
+        this.signaling.on('close', event => this.onClose(event));
         this.signaling.on('error', error => this.onError(error));
     }
 
-    async start(session: RTCSignalingSession): Promise<void> {
-        if (this.started)
-            throw new Error('LiveKit RTC session was already started.');
-        this.started = true;
+    static async start(liveKitURL: string, token: string, session: RTCSignalingSession): Promise<LiveKitRTCSessionControl> {
+        const options = await getSessionOptions(session);
+        const disableTrickle = !!options.disableTrickle;
+        const setup = createSetup();
+        const localCandidates = new IceCandidateQueue();
+        const offerId = 1;
+        const offer = await session.createLocalDescription(
+            'offer',
+            setup,
+            disableTrickle ? undefined : async candidate => localCandidates.add(candidate),
+        );
+        const signaling = new LiveKitSignaling(liveKitURL, {
+            token,
+            joinRequest: createWrappedJoinRequest(offerId, offer),
+        });
+        const control = new LiveKitRTCSessionControl(signaling, session, setup, localCandidates, !disableTrickle);
+        control.pendingAnswers.set(offerId, new Future<SessionDescription>());
 
-        const options = typeof session.options === 'object' ? session.options : await session.getOptions();
-        if (options.offer)
-            throw new Error('LiveKit and Scrypted both provided RTC offers.');
-
-        const configuration = await this.iceConfiguration;
-        this.disableTrickle = !!options.disableTrickle;
-        this.answerLiveKitOffers(session, options, configuration)
-            .catch(error => this.onError(error));
-        await this.audioVideoReady;
+        try {
+            await Promise.all([
+                control.joined.promise,
+                control.waitForAnswer(offerId),
+            ]);
+            await control.mediaReady.promise;
+            return control;
+        }
+        catch (e) {
+            await control.endSession();
+            throw e;
+        }
     }
 
     async getRefreshAt(): Promise<number | void> {
@@ -60,218 +105,283 @@ export class LiveKitRTCSessionControl implements RTCSessionControl {
     }
 
     async endSession(): Promise<void> {
-        if (this.ended)
+        if (this.closed)
             return;
-        this.ended = true;
-        this.rejectPending(new Error('LiveKit RTC session ended.'));
+        this.closed = true;
         await this.signaling.close();
     }
 
-    private onOffer(offer: SessionDescription): void {
-        const pendingOffer = {
-            offer,
-            remoteCandidates: new IceCandidateQueue(),
-        };
-        this.remoteCandidates = pendingOffer.remoteCandidates;
-        this.offers.add(pendingOffer);
+    private onJoin(join: JoinResponse): void {
+        this.ownParticipantSid = join.participant?.sid;
+        this.joined.resolve(join);
+        this.subscribeToParticipants(join.otherParticipants);
+        this.localCandidates.flush();
     }
 
-    private async answerLiveKitOffers(session: RTCSignalingSession, options: RTCSignalingOptions, configuration: RTCConfiguration): Promise<void> {
-        for await (const pendingOffer of this.offers) {
-            if (await this.answerOffer(session, options, configuration, pendingOffer))
-                this.audioVideoReady.resolve();
+    private async onAnswer(answer: SessionDescription): Promise<void> {
+        const future = this.findAnswerFuture(answer.id);
+        if (!future)
+            return;
+
+        try {
+            await this.session.setRemoteDescription(toRTCSessionDescription(answer), this.setup);
+            this.remoteDescriptionSet = true;
+            await this.flushRemoteCandidates();
+            future.resolve(answer);
         }
-    }
-
-    private async answerOffer(
-        session: RTCSignalingSession,
-        options: RTCSignalingOptions,
-        configuration: RTCConfiguration,
-        pendingOffer: PendingOffer,
-    ): Promise<boolean> {
-        const { offer, remoteCandidates } = pendingOffer;
-        if (offer.type !== 'offer')
-            throw new Error(`LiveKit sent unsupported session description type=${offer.type}.`);
-
-        const availableMediaKinds = offer.sdp
-            .split(/\r?\n/)
-            .map(line => /^m=([^ ]+) /.exec(line))
-            .filter((match): match is RegExpExecArray => !!match)
-            .filter(match => !match.input.startsWith(`m=${match[1]} 0 `))
-            .map(match => match[1]);
-        const selectedMediaKinds: string[] = [];
-        const capabilities = options.capabilities;
-        if (availableMediaKinds.includes('audio') && (!capabilities || !!capabilities.audio))
-            selectedMediaKinds.push('audio');
-        if (availableMediaKinds.includes('video') && (!capabilities || !!capabilities.video))
-            selectedMediaKinds.push('video');
-        if (availableMediaKinds.includes('application'))
-            selectedMediaKinds.push('application');
-        const setup: RTCAVSignalingSetup = {
-            type: 'answer',
-            audio: selectedMediaKinds.includes('audio') ? {
-                direction: 'sendrecv',
-            } : undefined,
-            video: selectedMediaKinds.includes('video') ? {
-                direction: 'recvonly',
-            } : undefined,
-            datachannel: selectedMediaKinds.includes('application') ? {
-                label: 'livekit',
-            } : undefined,
-            configuration,
-        };
-        const localCandidates = new IceCandidateQueue();
-
-        await session.setRemoteDescription({
-            type: 'offer',
-            sdp: offer.sdp,
-        }, setup);
-
-        const answer = await session.createLocalDescription(
-            'answer',
-            setup,
-            this.disableTrickle ? undefined : candidate => localCandidates.add(candidate),
-        );
-        this.signaling.sendAnswer(offer.id, answer);
-
-        if (!this.disableTrickle) {
-            await localCandidates.flush(async candidate => this.signaling.sendIceCandidate(candidate));
-            await remoteCandidates.flush(candidate => session.addIceCandidate(candidate));
+        catch (e) {
+            future.reject(e);
+            throw e;
         }
-
-        return availableMediaKinds.includes('audio') && availableMediaKinds.includes('video');
     }
 
     private async onTrickle(trickle: TrickleRequest): Promise<void> {
-        if (this.disableTrickle)
-            return;
-        if (trickle.target !== SignalTarget.SUBSCRIBER)
-            return;
-        if (trickle.final && !trickle.candidateInit)
-            return;
         if (!trickle.candidateInit)
-            throw new Error('LiveKit sent an ICE candidate without candidateInit.');
+            return;
 
         const candidate = JSON.parse(trickle.candidateInit) as RTCIceCandidateInit;
-        if (!candidate.candidate)
-            throw new Error(`LiveKit ICE candidate was missing candidate: ${trickle.candidateInit}`);
-        if (!candidate.sdpMid && candidate.sdpMLineIndex === undefined)
-            throw new Error(`LiveKit ICE candidate was missing sdpMid and sdpMLineIndex: ${trickle.candidateInit}`);
-
-        await this.remoteCandidates.add(candidate);
+        if (!this.remoteDescriptionSet) {
+            this.remoteCandidates.push(candidate);
+            return;
+        }
+        await this.session.addIceCandidate(candidate);
     }
 
-    private async onLeave(): Promise<void> {
-        await this.endSession();
+    private onUpdate(update: ParticipantUpdate): void {
+        this.subscribeToParticipants(update.participants);
+    }
+
+    private onTrackSubscribed(track: TrackSubscribed): void {
+        if (!track.trackSid)
+            return;
+        this.subscribedReadyTrackSids.add(track.trackSid);
+        this.checkMediaReady();
+    }
+
+    private onStreamStateUpdate(update: StreamStateUpdate): void {
+        for (const streamState of update.streamStates) {
+            if (!streamState.trackSid)
+                continue;
+            if (streamState.state === StreamState.ACTIVE)
+                this.activeTrackSids.add(streamState.trackSid);
+            else
+                this.activeTrackSids.delete(streamState.trackSid);
+        }
+        this.checkMediaReady();
+    }
+
+    private onSubscriptionResponse(_response: SubscriptionResponse): void {
+        this.checkMediaReady();
+    }
+
+    private onMediaSectionsRequirement(): void {
+        this.renegotiation = this.renegotiation
+            .then(() => this.sendRenegotiationOffer())
+            .catch(e => this.onError(e));
     }
 
     private onClose(event: LiveKitSignalingCloseEvent): void {
-        this.ended = true;
-        this.rejectPending(event.error);
+        if (!event.requested)
+            this.rejectPending(event.error);
+        this.closed = true;
     }
 
     private onError(error: unknown): void {
-        if (this.ended)
-            return;
         this.rejectPending(error);
-        this.endSession().catch(() => undefined);
+    }
+
+    private waitForAnswer(offerId: number): Promise<SessionDescription> {
+        const future = this.pendingAnswers.get(offerId);
+        if (!future)
+            throw new Error(`Missing LiveKit answer future for offer ${offerId}.`);
+        return future.promise;
+    }
+
+    private findAnswerFuture(offerId: number): Future<SessionDescription> | undefined {
+        const future = this.pendingAnswers.get(offerId);
+        if (future) {
+            this.pendingAnswers.delete(offerId);
+            return future;
+        }
+
+        if (offerId || this.pendingAnswers.size !== 1)
+            return;
+
+        const entry = this.pendingAnswers.entries().next().value;
+        if (!entry)
+            return;
+        const [pendingOfferId, pendingFuture] = entry;
+        this.pendingAnswers.delete(pendingOfferId);
+        return pendingFuture;
+    }
+
+    private subscribeToParticipants(participants: ParticipantInfo[]): void {
+        const trackSids: string[] = [];
+        for (const participant of participants) {
+            if (participant.sid === this.ownParticipantSid)
+                continue;
+
+            for (const track of participant.tracks) {
+                if (!isMediaTrack(track) || !track.sid || this.subscribedTrackSids.has(track.sid))
+                    continue;
+                this.trackKindsBySid.set(track.sid, track.type);
+                this.subscribedTrackSids.add(track.sid);
+                trackSids.push(track.sid);
+            }
+        }
+
+        if (!trackSids.length)
+            return;
+
+        this.signaling.sendSubscription(new UpdateSubscription({
+            trackSids,
+            subscribe: true,
+        }));
     }
 
     private rejectPending(error: unknown): void {
-        this.iceConfiguration.reject(error);
-        this.offers.reject(error);
-        this.audioVideoReady.reject(error);
+        this.joined.reject(error);
+        this.mediaReady.reject(error);
+        for (const future of this.pendingAnswers.values())
+            future.reject(error);
+        this.pendingAnswers.clear();
+    }
+
+    private async sendRenegotiationOffer(): Promise<void> {
+        if (this.closed)
+            return;
+
+        const offerId = this.nextOfferId++;
+        const offer = await this.session.createLocalDescription(
+            'offer',
+            this.setup,
+            this.trickleCandidates ? async candidate => this.localCandidates.add(candidate) : undefined,
+        );
+        this.pendingAnswers.set(offerId, new Future<SessionDescription>());
+        this.signaling.sendOffer(offerId, offer);
+        await this.waitForAnswer(offerId);
+    }
+
+    private async flushRemoteCandidates(): Promise<void> {
+        const candidates = this.remoteCandidates.splice(0);
+        for (const candidate of candidates)
+            await this.session.addIceCandidate(candidate);
+    }
+
+    private checkMediaReady(): void {
+        for (const [trackSid, kind] of this.trackKindsBySid.entries()) {
+            if (kind !== TrackType.VIDEO)
+                continue;
+            if (this.activeTrackSids.has(trackSid) || this.subscribedReadyTrackSids.has(trackSid))
+                this.mediaReady.resolve();
+        }
     }
 }
 
-interface PendingOffer {
-    offer: SessionDescription;
-    remoteCandidates: IceCandidateQueue;
-}
-
-class Future<T> implements PromiseLike<T> {
-    promise: Promise<T>;
+class Future<T> {
+    readonly promise: Promise<T>;
     resolve!: (value: T | PromiseLike<T>) => void;
     reject!: (reason?: unknown) => void;
-    then: Promise<T>['then'] = function (this: Future<T>) {
-        return this.promise.then.apply(this.promise, arguments as any);
-    } as Promise<T>['then'];
 
     constructor() {
         this.promise = new Promise<T>((resolve, reject) => {
             this.resolve = resolve;
             this.reject = reject;
         });
-        this.promise.catch(() => undefined);
     }
 }
 
 class IceCandidateQueue {
-    private sendCandidate?: RTCSignalingSendIceCandidate;
     private candidates: RTCIceCandidateInit[] = [];
-    private ready = false;
+    private flushing = false;
 
-    async flush(sendCandidate: RTCSignalingSendIceCandidate): Promise<void> {
-        const candidates = this.candidates;
-        this.sendCandidate = sendCandidate;
-        this.candidates = [];
-        this.ready = true;
-        for (const candidate of candidates)
-            await sendCandidate(candidate);
+    constructor(private send?: (candidate: RTCIceCandidateInit) => void) {
     }
 
-    async add(candidate: RTCIceCandidateInit): Promise<void> {
-        if (!this.ready || !this.sendCandidate) {
+    setSender(send: (candidate: RTCIceCandidateInit) => void): void {
+        this.send = send;
+    }
+
+    add(candidate: RTCIceCandidateInit): void {
+        if (!candidate?.candidate)
+            return;
+        if (!this.flushing) {
             this.candidates.push(candidate);
             return;
         }
+        this.send?.(candidate);
+    }
 
-        await this.sendCandidate(candidate);
+    flush(): void {
+        this.flushing = true;
+        const candidates = this.candidates;
+        this.candidates = [];
+        for (const candidate of candidates)
+            this.send?.(candidate);
     }
 }
 
-class AsyncQueue<T> implements AsyncIterable<T> {
-    private values: T[] = [];
-    private pendingNext?: Future<T>;
-    private rejected = false;
-    private rejection?: unknown;
+async function getSessionOptions(session: RTCSignalingSession): Promise<RTCSignalingOptions> {
+    return session.options || await session.getOptions();
+}
 
-    add(value: T): void {
-        if (this.rejected)
-            return;
+function createSetup(): RTCAVSignalingSetup {
+    return {
+        type: 'offer',
+        configuration: {
+            iceServers: [
+                {
+                    urls: 'turn:us-east-1.turn2.services.simplisafe.com:3478?transport=udp',
+                    username: 'XVgCJdEwj538ZBn4Dp7ytP',
+                    credential: 'zenuRYJjU93AFN5hT7L24G',
+                },
+            ],
+        },
+        audio: {
+            direction: 'recvonly',
+        },
+        video: {
+            direction: 'recvonly',
+        },
+        getUserMediaSafariHack: true,
+    };
+}
 
-        if (this.pendingNext) {
-            this.pendingNext.resolve(value);
-            this.pendingNext = undefined;
-            return;
-        }
+function createWrappedJoinRequest(offerId: number, offer: RTCSessionDescriptionInit): string {
+    const joinRequest = new JoinRequest({
+        clientInfo: new ClientInfo({
+            sdk: ClientInfo_SDK.JS,
+            version: liveKitSdkVersion,
+            protocol: liveKitProtocolVersion,
+            clientProtocol: liveKitProtocolVersion,
+        }),
+        connectionSettings: new ConnectionSettings({
+            autoSubscribe: false,
+            autoSubscribeDataTrack: false,
+        }),
+        publisherOffer: new SessionDescription({
+            id: offerId,
+            type: offer.type,
+            sdp: offer.sdp || '',
+        }),
+    });
+    const wrapped = new WrappedJoinRequest({
+        compression: WrappedJoinRequest_Compression.GZIP,
+        joinRequest: gzipSync(Buffer.from(joinRequest.toBinary())),
+    });
+    return Buffer.from(wrapped.toBinary())
+        .toString('base64')
+        .replace(/\+/g, '-')
+        .replace(/\//g, '_');
+}
 
-        this.values.push(value);
-    }
+function toRTCSessionDescription(description: SessionDescription): RTCSessionDescriptionInit {
+    return {
+        type: description.type as RTCSdpType,
+        sdp: description.sdp,
+    };
+}
 
-    async *[Symbol.asyncIterator](): AsyncIterator<T> {
-        while (true)
-            yield await this.next();
-    }
-
-    private async next(): Promise<T> {
-        if (this.rejected)
-            throw this.rejection;
-        if (this.values.length)
-            return this.values.shift() as T;
-
-        this.pendingNext = new Future<T>();
-        return this.pendingNext;
-    }
-
-    reject(error: unknown): void {
-        if (this.rejected)
-            return;
-
-        this.rejected = true;
-        this.rejection = error;
-        this.values = [];
-        this.pendingNext?.reject(error);
-        this.pendingNext = undefined;
-    }
+function isMediaTrack(track: TrackInfo): boolean {
+    return track.type === TrackType.AUDIO || track.type === TrackType.VIDEO;
 }
