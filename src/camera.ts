@@ -5,9 +5,9 @@ import {
     RTCSignalingSession,
 } from '@scrypted/sdk';
 import { SimpliSafeDevice } from './device';
-import { KVSRTCSignalingSession } from './media/kvs-rtc-signaling-session';
-import { LiveKitRTCSessionControl } from './media/livekit-rtc-session-control';
-import { connectRTCSignalingClients } from './media/rtc-signaling';
+import { connectRTCSignalingClients } from './rtc/common';
+import { KVSRTCSignalingSession } from './rtc/kvs';
+import { LiveKitRTCSessionControl } from './rtc/livekit';
 import type { SimpliSafeApi } from './simplisafe/api';
 import type { KVSLiveViewDetails, LiveKitLiveViewDetails, SimpliSafeCamera } from './simplisafe/camera';
 import type { SimpliSafeRealtimeEvent, SimpliSafeRealtimeEvents } from './simplisafe/realtime';
