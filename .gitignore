@@ -1,8 +1,7 @@
 node_modules/
 dist/
+/out/
 *.tgz
 .DS_Store
 .simplisafe-auth*.json
 .scrypted/
-
-/out/
