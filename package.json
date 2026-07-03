@@ -42,6 +42,7 @@
       "harness:auth-url": "tsx tools/discovery-harness.ts --auth-url",
       "harness:discovery": "tsx tools/discovery-harness.ts",
       "harness:live-view": "tsx tools/discovery-harness.ts --live-view",
+      "harness:schema-shapes": "tsx tools/discovery-harness.ts --schema-shapes",
       "scrypted-readme": "scrypted-readme"
    },
    "scrypted": {

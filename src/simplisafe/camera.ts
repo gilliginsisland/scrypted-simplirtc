@@ -1,83 +1,79 @@
 import { z } from 'zod';
+import type { SimpliSafeApi } from './api';
 
-export type SimpliSafeCameraBackend = 'kvs' | 'mist';
+const liveViewBaseUrl = 'https://app-hub.prd.aser.simplisafe.com/v2';
 
-export interface SimpliSafeIceServer {
-    urls: string | string[];
-    username?: string;
-    credential?: string;
-}
-
-export interface SimpliSafeCameraDetails<Backend extends string = string> {
-    name: string;
-    serial: string;
-    eventSerials: string[];
-    systemId: number;
-    systemName?: string;
-    backend: Backend;
-    model?: string;
-    firmware?: string;
-    raw: unknown;
-}
-
-export interface SimpliSafeCameraApi {
-    getLiveView(camera: Pick<SimpliSafeCameraDetails, 'serial' | 'systemId'>): Promise<unknown>;
-}
-
-export type SimpliSafeLiveViewDetails = KVSLiveViewDetails | LiveKitLiveViewDetails;
-
-export interface KVSLiveViewDetails {
-    backend: 'kvs';
-    signedChannelEndpoint: string;
-    clientId: string;
-    iceServers: SimpliSafeIceServer[];
-    raw: Record<string, unknown>;
-}
-
-export interface LiveKitLiveViewDetails {
-    backend: 'mist';
-    liveKitURL: string;
-    userToken: string;
-    raw: Record<string, unknown>;
-}
+const cameraAdminSchema = z.looseObject({
+    webRTCProvider: z.string().min(1),
+    firmwareVersion: z.string().min(1),
+});
+const cameraSettingsSchema = z.looseObject({
+    cameraName: z.string().min(1),
+    admin: cameraAdminSchema,
+});
+export const cameraSchema = z.looseObject({
+    uuid: z.string().min(1),
+    serial: z.string().min(1),
+    sid: z.number(),
+    model: z.string().min(1),
+    cameraSettings: cameraSettingsSchema,
+});
+export type SimpliSafeCameraDetails = z.output<typeof cameraSchema>;
 
 export class SimpliSafeCamera {
-    name!: string;
-    serial!: string;
-    eventSerials!: string[];
-    systemId!: number;
-    systemName?: string;
-    backend!: SimpliSafeCameraBackend;
-    model?: string;
-    firmware?: string;
-    raw!: unknown;
+    #details!: SimpliSafeCameraDetails;
 
-    constructor(private api: SimpliSafeCameraApi, camera: SimpliSafeCameraDetails<SimpliSafeCameraBackend>) {
-        this.update(camera);
+    constructor(private api: SimpliSafeApi) {
     }
 
-    update(camera: SimpliSafeCameraDetails<SimpliSafeCameraBackend>): void {
-        this.name = camera.name;
-        this.serial = camera.serial;
-        this.eventSerials = camera.eventSerials;
-        this.systemId = camera.systemId;
-        this.systemName = camera.systemName;
-        this.backend = camera.backend;
-        this.model = camera.model;
-        this.firmware = camera.firmware;
-        this.raw = camera.raw;
+    update(details: SimpliSafeCameraDetails): void {
+        this.#details = details;
     }
 
-    async getLiveView(): Promise<SimpliSafeLiveViewDetails> {
-        const liveView = await this.api.getLiveView(this);
-        switch (this.backend) {
-            case 'kvs':
-                return parseKVSLiveView(liveView);
-            case 'mist':
-                return parseLiveKitLiveView(liveView);
-            default:
-                return assertNever(this.backend, 'Unsupported SimpliSafe camera backend.');
-        }
+    get name(): string {
+        return this.#details.cameraSettings.cameraName;
+    }
+
+    get serial(): string {
+        return this.#details.uuid;
+    }
+
+    get eventSerials(): readonly string[] {
+        return [this.#details.uuid, this.#details.serial];
+    }
+
+    get systemId(): number {
+        return this.#details.sid;
+    }
+
+    get backend(): SimpliSafeCameraBackend {
+        return this.#details.cameraSettings.admin.webRTCProvider;
+    }
+
+    get model(): string {
+        return this.#details.model;
+    }
+
+    get firmware(): string {
+        return this.#details.cameraSettings.admin.firmwareVersion;
+    }
+
+    get raw(): SimpliSafeCameraDetails {
+        return this.#details;
+    }
+
+    async getLiveView<Backend extends SimpliSafeCameraBackend>(backend: Backend): Promise<SimpliSafeLiveView<Backend>> {
+        const liveView = await this.api.request(`cameras/${encodeURIComponent(this.serial)}/${encodeURIComponent(this.systemId.toString())}/live-view`, {
+            baseUrl: liveViewBaseUrl,
+        });
+        const liveViewSchema = Object.prototype.hasOwnProperty.call(liveViewParsers, backend)
+            ? backend as SimpliSafeKnownCameraBackend
+            : 'raw';
+        const liveViewParser = liveViewSchema === 'raw' ? raw : liveViewParsers[liveViewSchema];
+        return {
+            ...liveViewParser.parse(liveView),
+            [schema]: liveViewSchema,
+        } as SimpliSafeLiveView<Backend>;
     }
 
 }
@@ -86,46 +82,35 @@ const iceServerSchema = z.looseObject({
     urls: z.union([
         z.string().min(1),
         z.array(z.string().min(1)).min(1),
-    ]).transform(urls => Array.isArray(urls) && urls.length === 1 ? urls[0] : urls),
+    ]),
     username: z.string().min(1).optional(),
     credential: z.string().min(1).optional(),
 });
-const kvsLiveViewSchema = z.looseObject({
-    signedChannelEndpoint: z.string().min(1),
-    clientId: z.string().min(1),
-    iceServers: z.array(iceServerSchema).min(1),
-});
-const liveKitLiveViewSchema = z.looseObject({
-    liveKitDetails: z.looseObject({
-        liveKitURL: z.string().min(1),
-        userToken: z.string().min(1),
+export const raw = z.looseObject({});
+export const schema = Symbol('schema');
+
+const liveViewParsers = {
+    kvs: z.looseObject({
+        signedChannelEndpoint: z.string().min(1),
+        clientId: z.string().min(1),
+        iceServers: z.array(iceServerSchema).min(1),
     }),
-});
+    mist: z.looseObject({
+        liveKitDetails: z.looseObject({
+            liveKitURL: z.string().min(1),
+            userToken: z.string().min(1),
+        }),
+    }),
+} as const satisfies Readonly<Record<string, z.ZodType>>;
 
-function parseKVSLiveView(liveView: unknown): KVSLiveViewDetails {
-    const liveViewDetails = kvsLiveViewSchema.parse(liveView);
+export type SimpliSafeKnownCameraBackend = keyof typeof liveViewParsers;
+export type SimpliSafeCameraBackend = keyof typeof liveViewParsers | (string & {});
 
-    return {
-        backend: 'kvs',
-        signedChannelEndpoint: liveViewDetails.signedChannelEndpoint,
-        clientId: liveViewDetails.clientId,
-        iceServers: liveViewDetails.iceServers,
-        raw: liveViewDetails,
-    };
-}
+type SimpliSafeLiveViewParser<Backend extends string> = Backend extends SimpliSafeKnownCameraBackend
+    ? (typeof liveViewParsers)[Backend]
+    : typeof raw;
+type SimpliSafeLiveViewSchema<Backend extends string> = Backend extends SimpliSafeKnownCameraBackend ? Backend : 'raw';
 
-function parseLiveKitLiveView(liveView: unknown): LiveKitLiveViewDetails {
-    const liveViewDetails = liveKitLiveViewSchema.parse(liveView);
-
-    return {
-        backend: 'mist',
-        liveKitURL: liveViewDetails.liveKitDetails.liveKitURL,
-        userToken: liveViewDetails.liveKitDetails.userToken,
-        raw: liveViewDetails,
-    };
-}
-
-function assertNever(value: never, message: string): never {
-    void value;
-    throw new Error(message);
-}
+export type SimpliSafeLiveView<Backend extends string = SimpliSafeCameraBackend> = Backend extends string
+    ? z.output<SimpliSafeLiveViewParser<Backend>> & { [schema]: SimpliSafeLiveViewSchema<Backend> }
+    : never;

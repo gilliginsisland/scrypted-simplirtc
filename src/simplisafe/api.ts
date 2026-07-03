@@ -1,66 +1,60 @@
-import type { SimpliSafeCameraDetails } from './camera';
-import { SimpliSafeAuth } from './oauth';
-import { SimpliSafeSubscription, subscriptionEnvelopeSchema } from './subscription';
 import { z } from 'zod';
+import { SimpliSafeAuth } from './oauth';
+import { SimpliSafeSubscription, subscriptionEnvelopeSchema, subscriptionSummarySchema } from './subscription';
 
 const apiBaseUrl = 'https://api.simplisafe.com/v1';
-const liveViewBaseUrl = 'https://app-hub.prd.aser.simplisafe.com/v2';
 
 const authCheckSchema = z.looseObject({
-    userId: z.number().finite(),
+    userId: z.number(),
 });
 const subscriptionsResponseSchema = z.looseObject({
-    subscriptions: z.array(z.unknown()),
+    subscriptions: z.array(subscriptionSummarySchema),
 });
-const unknownSchema = z.unknown();
 
 export interface SimpliSafeRequestOptions<Schema extends z.ZodType> extends RequestInit {
-    schema: Schema;
+    schema?: Schema;
     baseUrl?: string;
 }
 
 export class SimpliSafeApi {
     private auth: SimpliSafeAuth;
-    private subscriptions = new Map<number, SimpliSafeSubscription>();
+    #subscriptions = new Map<number, SimpliSafeSubscription>();
 
     constructor(auth: SimpliSafeAuth) {
         this.auth = auth;
     }
 
-    async request<Schema extends z.ZodType>(path: string, options: SimpliSafeRequestOptions<Schema>): Promise<z.output<Schema>> {
-        const { schema, baseUrl = apiBaseUrl, ...init } = options;
+    async request<Schema extends z.ZodType>(path: string, options: SimpliSafeRequestOptions<Schema> & { schema: Schema }): Promise<z.output<Schema>>;
+    async request(path: string, options?: SimpliSafeRequestOptions<z.ZodType>): Promise<unknown>;
+    async request(path: string, options: SimpliSafeRequestOptions<z.ZodType> = {}): Promise<unknown> {
+        const { schema = z.unknown(), baseUrl = apiBaseUrl, ...init } = options;
         return schema.parse(await this.requestJson(path, init, baseUrl));
     }
 
     async update(): Promise<void> {
         const userId = await this.getUserId();
-        const response = await this.getSubscriptionSummaries(userId);
+        const response = await this.request(`users/${encodeURIComponent(userId.toString())}/subscriptions?activeOnly=false`, {
+            schema: subscriptionsResponseSchema,
+        });
         const subscriptionIds = new Set<number>();
 
-        for (const subscriptionDetails of response.subscriptions) {
-            const discovered = new SimpliSafeSubscription(this, subscriptionDetails);
-            if (!discovered.id)
-                continue;
-
-            subscriptionIds.add(discovered.id);
-            const existing = this.subscriptions.get(discovered.id);
-            if (existing)
-                existing.updateSummary(subscriptionDetails);
-            else
-                this.subscriptions.set(discovered.id, discovered);
+        for (const subscription of response.subscriptions) {
+            subscriptionIds.add(subscription.sid);
+            if (!this.#subscriptions.has(subscription.sid))
+                this.#subscriptions.set(subscription.sid, new SimpliSafeSubscription(this, subscription.sid));
         }
 
-        for (const subscriptionId of this.subscriptions.keys()) {
+        for (const subscriptionId of this.#subscriptions.keys()) {
             if (!subscriptionIds.has(subscriptionId))
-                this.subscriptions.delete(subscriptionId);
+                this.#subscriptions.delete(subscriptionId);
         }
 
-        for (const subscription of this.subscriptions.values())
+        for (const subscription of this.#subscriptions.values())
             await subscription.update();
     }
 
-    getSubscriptions(): Iterable<SimpliSafeSubscription> {
-        return this.subscriptions.values();
+    subscriptions(): Iterable<SimpliSafeSubscription> {
+        return this.#subscriptions.values();
     }
 
     private async requestJson(path: string, init: RequestInit, baseUrl: string): Promise<unknown> {
@@ -71,10 +65,10 @@ export class SimpliSafeApi {
             headers.set('Accept', 'application/json');
         headers.set('Authorization', `${tokenType} ${accessToken}`);
         const method = init.method ?? 'GET';
-        const response = await fetch(new URL(path, baseUrl.endsWith('/') ? baseUrl : `${baseUrl}/`), {
-            ...init,
-            headers,
-        });
+        const response = await fetch(
+            new URL(path, baseUrl.endsWith('/') ? baseUrl : `${baseUrl}/`),
+            { ...init, headers },
+        );
 
         const text = await response.text();
         if (!response.ok)
@@ -85,32 +79,9 @@ export class SimpliSafeApi {
     }
 
     async getUserId(): Promise<number> {
-        const response = await this.getAuthCheck();
-        return response.userId;
-    }
-
-    private async getAuthCheck(): Promise<z.output<typeof authCheckSchema>> {
-        return this.request('api/authCheck', {
+        const response = await this.request('api/authCheck', {
             schema: authCheckSchema,
         });
-    }
-
-    private async getSubscriptionSummaries(userId: number): Promise<z.output<typeof subscriptionsResponseSchema>> {
-        return this.request(`users/${encodeURIComponent(userId.toString())}/subscriptions?activeOnly=false`, {
-            schema: subscriptionsResponseSchema,
-        });
-    }
-
-    async getSubscription(subscriptionId: number): Promise<z.output<typeof subscriptionEnvelopeSchema>> {
-        return this.request(`subscriptions/${encodeURIComponent(subscriptionId.toString())}/`, {
-            schema: subscriptionEnvelopeSchema,
-        });
-    }
-
-    async getLiveView(camera: Pick<SimpliSafeCameraDetails, 'serial' | 'systemId'>): Promise<unknown> {
-        return this.request(`cameras/${encodeURIComponent(camera.serial)}/${encodeURIComponent(camera.systemId.toString())}/live-view`, {
-            schema: unknownSchema,
-            baseUrl: liveViewBaseUrl,
-        });
+        return response.userId;
     }
 }

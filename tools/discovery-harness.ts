@@ -1,7 +1,8 @@
 import fs from 'fs';
 import path from 'path';
 import { SimpliSafeApi } from '../src/simplisafe/api';
-import type { SimpliSafeCamera, SimpliSafeLiveViewDetails } from '../src/simplisafe/camera';
+import { schema } from '../src/simplisafe/camera';
+import type { SimpliSafeCamera } from '../src/simplisafe/camera';
 import { SimpliSafeAuth } from '../src/simplisafe/oauth';
 import type { SimpliSafeTokenState, SimpliSafeTokenStore } from '../src/simplisafe/oauth';
 
@@ -48,11 +49,15 @@ async function main(): Promise<void> {
     }
 
     const api = new SimpliSafeApi(auth);
+    if (args.has('--schema-shapes')) {
+        await inspectSubscriptionSchemas(api);
+        return;
+    }
     await api.update();
 
     const cameras: SimpliSafeCamera[] = [];
-    for (const subscription of api.getSubscriptions()) {
-        for (const camera of subscription.getCameras())
+    for (const subscription of api.subscriptions()) {
+        for (const camera of subscription.cameras())
             cameras.push(camera);
     }
     console.log(JSON.stringify(cameras.map(camera => ({
@@ -60,7 +65,6 @@ async function main(): Promise<void> {
         serial: camera.serial,
         eventSerials: camera.eventSerials,
         systemId: camera.systemId,
-        systemName: camera.systemName,
         backend: camera.backend,
         model: camera.model,
         firmware: camera.firmware,
@@ -71,13 +75,64 @@ async function main(): Promise<void> {
         return;
 
     for (const camera of cameras) {
-        const liveView = await camera.getLiveView();
-        console.log(JSON.stringify({
-            camera: camera.name,
-            serial: camera.serial,
-            ...summarizeLiveView(liveView),
-        }, null, 2));
+        switch (camera.backend) {
+            case 'kvs': {
+                const liveView = await camera.getLiveView('kvs');
+                console.log(JSON.stringify({
+                    camera: camera.name,
+                    serial: camera.serial,
+                    provider: 'kvs',
+                    hasSignedChannelEndpoint: !!liveView.signedChannelEndpoint,
+                    clientId: liveView.clientId,
+                    iceServerCount: liveView.iceServers.length,
+                }, null, 2));
+                break;
+            }
+            case 'mist': {
+                const liveView = await camera.getLiveView('mist');
+                console.log(JSON.stringify({
+                    camera: camera.name,
+                    serial: camera.serial,
+                    provider: 'mist',
+                    liveKitURL: liveView.liveKitDetails.liveKitURL,
+                    hasUserToken: !!liveView.liveKitDetails.userToken,
+                    userTokenExpiresAt: decodeJwtExpiry(liveView.liveKitDetails.userToken),
+                }, null, 2));
+                break;
+            }
+            default: {
+                const liveView = await camera.getLiveView(camera.backend);
+                console.log(JSON.stringify({
+                    camera: camera.name,
+                    serial: camera.serial,
+                    provider: camera.backend,
+                    raw: liveView[schema] === 'raw',
+                }, null, 2));
+                break;
+            }
+        }
     }
+}
+
+async function inspectSubscriptionSchemas(api: SimpliSafeApi): Promise<void> {
+    const userId = await api.getUserId();
+    const summaries = await api.request(`users/${encodeURIComponent(userId.toString())}/subscriptions?activeOnly=false`);
+    const summaryEnvelope = assertRecord(summaries, 'SimpliSafe subscription summaries');
+    if (!Array.isArray(summaryEnvelope.subscriptions))
+        throw new Error('SimpliSafe subscription summaries must contain a subscriptions array.');
+
+    const details = [];
+    for (const summary of summaryEnvelope.subscriptions) {
+        const subscription = assertRecord(summary, 'SimpliSafe subscription summary');
+        if (typeof subscription.sid !== 'number')
+            throw new Error('SimpliSafe subscription summary must contain a numeric sid.');
+        details.push(await api.request(`subscriptions/${encodeURIComponent(subscription.sid.toString())}/`));
+    }
+
+    console.log(JSON.stringify({
+        summaries: describeShape(summaries),
+        details: details.map(describeShape),
+    }, null, 2));
 }
 
 function seedTokensFromEnvironment(store: JsonFileTokenStore, tokenFile: string): void {
@@ -128,27 +183,6 @@ function summarizeCameraOptions(rawCamera: unknown): Record<string, unknown> {
     };
 }
 
-function summarizeLiveView(liveView: SimpliSafeLiveViewDetails): Record<string, unknown> {
-    switch (liveView.backend) {
-        case 'kvs':
-            return {
-                provider: 'kvs',
-                hasSignedChannelEndpoint: !!liveView.signedChannelEndpoint,
-                clientId: liveView.clientId,
-                iceServerCount: liveView.iceServers.length,
-            };
-        case 'mist':
-            return {
-                provider: 'mist',
-                liveKitURL: liveView.liveKitURL,
-                hasUserToken: !!liveView.userToken,
-                userTokenExpiresAt: decodeJwtExpiry(liveView.userToken),
-            };
-        default:
-            return assertNever(liveView, 'Unsupported SimpliSafe live-view backend.');
-    }
-}
-
 function accessTokenTtlMs(): number {
     const value = process.env.SIMPLISAFE_ACCESS_TOKEN_TTL_MS;
     if (!value)
@@ -169,6 +203,25 @@ function assertOptionalRecord(value: unknown, label: string): Record<string, unk
     if (value === undefined || value === null)
         return undefined;
     return assertRecord(value, label);
+}
+
+function describeShape(value: unknown, depth = 0): unknown {
+    if (value === null)
+        return 'null';
+    if (Array.isArray(value)) {
+        return {
+            type: 'array',
+            length: value.length,
+            item: value.length ? describeShape(value[0], depth + 1) : undefined,
+        };
+    }
+    if (typeof value !== 'object')
+        return typeof value;
+
+    const object = value as Record<string, unknown>;
+    if (depth === 5)
+        return 'object';
+    return Object.fromEntries(Object.keys(object).sort().map(key => [key, describeShape(object[key], depth + 1)]));
 }
 
 function firstDefined<T>(...values: T[]): T | undefined {
@@ -192,10 +245,6 @@ function decodeJwtExpiry(token: string | undefined): string | undefined {
     }
 }
 
-function assertNever(value: never, message: string): never {
-    void value;
-    throw new Error(message);
-}
 
 main().catch(e => {
     console.error(e);

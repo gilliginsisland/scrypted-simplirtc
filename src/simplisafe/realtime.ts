@@ -52,15 +52,15 @@ export interface SimpliSafeRealtimeEventMap {
 const realtimeStandardEventSchema = z.looseObject({
     type: z.literal('com.simplisafe.event.standard'),
     data: z.looseObject({
-        eventCid: z.number().finite().optional(),
-        eventTimestamp: z.number().finite().optional(),
+        eventCid: z.number().optional(),
+        eventTimestamp: z.number().optional(),
         info: z.string().min(1).optional(),
-        sid: z.number().finite().optional(),
+        sid: z.number().optional(),
         sensorName: z.string().min(1).optional(),
         sensorSerial: z.string().min(1).optional(),
         sensorType: z.union([
             z.string().min(1),
-            z.number().finite(),
+            z.number(),
         ]).optional(),
     }),
 });

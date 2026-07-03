@@ -9,7 +9,7 @@ import { connectRTCSignalingClients } from './rtc/common';
 import { KVSRTCSignalingSession } from './rtc/kvs';
 import { LiveKitRTCSessionControl } from './rtc/livekit';
 import type { SimpliSafeApi } from './simplisafe/api';
-import type { KVSLiveViewDetails, LiveKitLiveViewDetails, SimpliSafeCamera } from './simplisafe/camera';
+import type { SimpliSafeCamera } from './simplisafe/camera';
 import type { SimpliSafeRealtimeEvent, SimpliSafeRealtimeEvents } from './simplisafe/realtime';
 
 const motionHoldMs = 30_000;
@@ -45,9 +45,9 @@ export class SimpliSafeCameraDevice extends SimpliSafeDevice implements RTCSigna
     }
 
     async startRTCSignalingSession(session: RTCSignalingSession): Promise<RTCSessionControl> {
-        const liveView = await this.camera.getLiveView();
-        switch (liveView.backend) {
+        switch (this.camera.backend) {
             case 'kvs': {
+                const liveView = await this.camera.getLiveView('kvs');
                 const kvsSession = new KVSRTCSignalingSession(liveView);
                 void connectRTCSignalingClients(session, {
                     configuration: {
@@ -63,8 +63,14 @@ export class SimpliSafeCameraDevice extends SimpliSafeDevice implements RTCSigna
                 }, kvsSession, {}).catch(() => kvsSession.endSession());
                 return kvsSession;
             }
-            case 'mist':
-                return LiveKitRTCSessionControl.start(liveView.liveKitURL, liveView.userToken, session);
+            case 'mist': {
+                const liveView = await this.camera.getLiveView('mist');
+                return LiveKitRTCSessionControl.start(
+                    liveView.liveKitDetails.liveKitURL,
+                    liveView.liveKitDetails.userToken,
+                    session,
+                );
+            }
             default:
                 throw new Error('Unsupported SimpliSafe live-view backend.');
         }

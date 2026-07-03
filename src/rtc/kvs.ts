@@ -15,6 +15,8 @@ const kvsResponseSchema = z.looseObject({
     messageType: z.string(),
     messagePayload: z.string(),
 });
+export const raw = z.unknown();
+export const schema = Symbol('schema');
 
 const kvsMessagePayloadSchemas = {
     SDP_OFFER: z.looseObject({
@@ -34,14 +36,17 @@ const kvsMessagePayloadSchemas = {
 } as const satisfies Readonly<Record<string, z.ZodType>>;
 
 export type KVSMessageType = keyof typeof kvsMessagePayloadSchemas;
-type KVSMessagePayload<Type extends string> = Type extends KVSMessageType
-    ? z.output<(typeof kvsMessagePayloadSchemas)[Type]>
-    : any;
+type KVSMessageParser<Type extends string> = Type extends KVSMessageType
+    ? (typeof kvsMessagePayloadSchemas)[Type]
+    : typeof raw;
+type KVSMessageSchema<Type extends string> = Type extends KVSMessageType ? Type : 'raw';
+type KVSMessagePayload<Type extends string> = z.output<KVSMessageParser<Type>>;
 
 export type KVSMessage<Type extends string = KVSMessageType> = Type extends string
     ? {
         messageType: Type;
         messagePayload: KVSMessagePayload<Type>;
+        [schema]: KVSMessageSchema<Type>;
     }
     : never;
 
@@ -52,9 +57,7 @@ export interface KVSRequest<Type extends string = KVSMessageType> {
     messagePayload: KVSMessagePayload<Type>;
 }
 
-export type KVSResponse =
-    | { known: true } & KVSMessage<KVSMessageType>
-    | { known: false } & KVSMessage<string>;
+export type KVSResponse = KVSMessage<KVSMessageType> | KVSMessage<string>;
 
 export function serializeKVSRequest<Type extends string>(request: KVSRequest<Type>): string {
     return JSON.stringify({
@@ -66,15 +69,14 @@ export function serializeKVSRequest<Type extends string>(request: KVSRequest<Typ
 export function unserializeKVSResponse(data: string): KVSResponse {
     const parsed = kvsResponseSchema.parse(JSON.parse(data));
     const payload = JSON.parse(Buffer.from(parsed.messagePayload, 'base64').toString('utf8'));
-    const schema = Object.prototype.hasOwnProperty.call(kvsMessagePayloadSchemas, parsed.messageType)
-        ? kvsMessagePayloadSchemas[parsed.messageType as KVSMessageType]
-        : undefined;
+    const messageSchema = Object.prototype.hasOwnProperty.call(kvsMessagePayloadSchemas, parsed.messageType)
+        ? parsed.messageType as KVSMessageType
+        : 'raw';
+    const messageParser = messageSchema === 'raw' ? raw : kvsMessagePayloadSchemas[messageSchema];
     return {
         ...parsed,
-        known: !!schema,
-        messagePayload: schema
-            ? schema.parse(payload)
-            : payload
+        messagePayload: messageParser.parse(payload),
+        [schema]: messageSchema,
     } as KVSResponse;
 }
 
@@ -186,19 +188,19 @@ export class KVSRTCSignalingSession implements RTCSignalingSession, RTCSessionCo
 
     private async receiveMessages(): Promise<void> {
         for await (const [data] of on(this.ws, 'message', { close: ['close'] })) {
-            const raw = (data as Buffer).toString('utf8');
-            if (!raw)
+            const messageData = (data as Buffer).toString('utf8');
+            if (!messageData)
                 continue;
 
             let message: ReturnType<typeof unserializeKVSResponse>;
             try {
-                message = unserializeKVSResponse(raw);
+                message = unserializeKVSResponse(messageData);
             }
             catch (error) {
                 console.error('Failed to parse KVS signaling message.', error);
                 continue;
             }
-            if (!message.known)
+            if (message[schema] === 'raw')
                 continue;
 
             switch (message.messageType) {

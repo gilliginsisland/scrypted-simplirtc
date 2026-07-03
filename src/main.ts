@@ -1,4 +1,14 @@
-import sdk, { Device, DeviceProvider, Refresh, ScryptedDeviceBase, ScryptedDeviceType, ScryptedInterface, Setting, Settings, SettingValue } from '@scrypted/sdk';
+import sdk, {
+    Device,
+    DeviceProvider,
+    Refresh,
+    ScryptedDeviceBase,
+    ScryptedDeviceType,
+    ScryptedInterface,
+    Setting,
+    Settings,
+    SettingValue,
+} from '@scrypted/sdk';
 import { StorageSettings } from '@scrypted/sdk/storage-settings';
 import { SimpliSafeCameraDevice } from './camera';
 import { SimpliSafeApi } from './simplisafe/api';
@@ -93,7 +103,9 @@ export default class SimpliSafePlugin extends ScryptedDeviceBase implements Devi
 
     constructor(nativeId?: string) {
         super(nativeId);
-        this.refresh(ScryptedInterface.DeviceProvider, false).catch(e => this.console.error('SimpliSafe refresh failed.', e));
+        this.refresh(ScryptedInterface.DeviceProvider, false).catch(
+            e => this.console.error('SimpliSafe refresh failed.', e)
+        );
     }
 
     async getSettings(): Promise<Setting[]> {
@@ -128,35 +140,39 @@ export default class SimpliSafePlugin extends ScryptedDeviceBase implements Devi
             await this.api.update();
 
             const cameras = new Map<string, SimpliSafeCamera>();
-            for (const subscription of this.api.getSubscriptions()) {
-                for (const camera of subscription.getCameras()) {
+            for (const subscription of this.api.subscriptions()) {
+                for (const camera of subscription.cameras()) {
                     const nativeId = `${camera.systemId}:${camera.serial}`;
                     cameras.set(nativeId, camera);
                 }
             }
             this.cameras = cameras;
 
-            const devices: Device[] = Array.from(this.cameras.entries()).map(([nativeId, camera]) => {
-                return {
-                    nativeId,
-                    name: camera.name,
-                    type: ScryptedDeviceType.Camera,
-                    interfaces: [
-                        ScryptedInterface.MotionSensor,
-                        ScryptedInterface.RTCSignalingChannel,
-                    ],
-                    info: {
-                        manufacturer: 'SimpliSafe',
-                        model: camera.model ?? camera.backend,
-                        firmware: camera.firmware,
-                        serialNumber: camera.serial,
-                    },
-                };
-            });
+            const devices: Device[] = Array.from(this.cameras.entries()).map(
+                ([nativeId, camera]) => {
+                    return {
+                        nativeId,
+                        name: camera.name,
+                        type: ScryptedDeviceType.Camera,
+                        interfaces: [
+                            ScryptedInterface.MotionSensor,
+                            ScryptedInterface.RTCSignalingChannel,
+                        ],
+                        info: {
+                            manufacturer: 'SimpliSafe',
+                            model: camera.model,
+                            firmware: camera.firmware,
+                            serialNumber: camera.serial,
+                        },
+                    };
+                }
+            );
 
             await deviceManager.onDevicesChanged({ devices });
             this.console.log(`Discovered ${devices.length} supported SimpliSafe camera(s).`);
-        })().finally(() => this.refreshPromise = undefined);
+        })().finally(
+            () => this.refreshPromise = undefined
+        );
 
         return this.refreshPromise;
     }

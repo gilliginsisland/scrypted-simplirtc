@@ -26,7 +26,7 @@ export interface SimpliSafeTokenStore {
 }
 
 const tokenExpiresInSchema = z.union([
-    z.number().finite().positive(),
+    z.number().positive(),
     z.string().min(1).regex(/^\d+$/).transform(value => Number(value)),
 ]);
 const tokenResponseSchema = z.looseObject({
