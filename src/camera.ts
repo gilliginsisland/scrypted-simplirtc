@@ -49,7 +49,7 @@ export class SimpliSafeCameraDevice extends SimpliSafeDevice implements RTCSigna
             case 'kvs': {
                 const liveView = await this.camera.getLiveView('kvs');
                 const kvsSession = new KVSRTCSignalingSession(liveView);
-                void connectRTCSignalingClients(session, {
+                await connectRTCSignalingClients(session, {
                     configuration: {
                         iceServers: liveView.iceServers,
                     },
@@ -60,7 +60,10 @@ export class SimpliSafeCameraDevice extends SimpliSafeDevice implements RTCSigna
                         direction: 'recvonly',
                     },
                     getUserMediaSafariHack: true,
-                }, kvsSession, {}).catch(() => kvsSession.endSession());
+                }, kvsSession, {}).catch(error => {
+                    this.console.error('Failed to negotiate SimpliSafe KVS session.', error);
+                    return kvsSession.endSession();
+                });
                 return kvsSession;
             }
             case 'mist': {

@@ -7,14 +7,32 @@ import {
 } from '@scrypted/sdk';
 import { randomUUID } from 'crypto';
 import { on } from 'events';
-import WebSocket from 'ws';
+import { parse, parseParams, write } from 'sdp-transform';
+import { WebSocket } from 'ws';
 import { z } from 'zod';
 import { createCandidateQueue, Deferred } from './common';
 
-const kvsResponseSchema = z.looseObject({
-    messageType: z.string(),
-    messagePayload: z.string(),
+const maxKVSMessagePayloadSize = 10 * 1024;
+
+const kvsStatusResponseSchema = z.looseObject({
+    correlationId: z.string(),
+    errorType: z.string().optional(),
+    statusCode: z.string().optional(),
+    description: z.string().optional(),
 });
+const kvsStatusResponseEnvelopeSchema = z.looseObject({
+    messageType: z.literal('STATUS_RESPONSE'),
+    messagePayload: z.string().optional(),
+    statusResponse: kvsStatusResponseSchema,
+});
+const kvsMessageEnvelopeSchema = z.union([
+    kvsStatusResponseEnvelopeSchema,
+    z.looseObject({
+        messageType: z.string().refine(messageType => messageType !== 'STATUS_RESPONSE'),
+        messagePayload: z.string(),
+        statusResponse: z.never().optional(),
+    }),
+]);
 export const raw = z.unknown();
 export const schema = Symbol('schema');
 
@@ -57,27 +75,90 @@ export interface KVSRequest<Type extends string = KVSMessageType> {
     messagePayload: KVSMessagePayload<Type>;
 }
 
-export type KVSResponse = KVSMessage<KVSMessageType> | KVSMessage<string>;
+type KVSStatusResponse = z.output<typeof kvsStatusResponseEnvelopeSchema> & { [schema]: 'STATUS_RESPONSE' };
+export type KVSResponse = KVSMessage<KVSMessageType> | KVSMessage<string> | KVSStatusResponse;
+
+function serializeKVSMessagePayload(messagePayload: unknown): string {
+    return Buffer.from(JSON.stringify(messagePayload)).toString('base64');
+}
 
 export function serializeKVSRequest<Type extends string>(request: KVSRequest<Type>): string {
+    const messagePayload = serializeKVSMessagePayload(request.messagePayload);
+    if (Buffer.byteLength(messagePayload) > maxKVSMessagePayloadSize)
+        throw new Error(`KVS ${request.action} message payload exceeds the 10 KiB limit.`);
+
     return JSON.stringify({
         ...request,
-        messagePayload: Buffer.from(JSON.stringify(request.messagePayload)).toString('base64'),
+        messagePayload,
     });
 }
 
 export function unserializeKVSResponse(data: string): KVSResponse {
-    const parsed = kvsResponseSchema.parse(JSON.parse(data));
-    const payload = JSON.parse(Buffer.from(parsed.messagePayload, 'base64').toString('utf8'));
+    const parsed = kvsMessageEnvelopeSchema.parse(JSON.parse(data));
+    if (parsed.messageType === 'STATUS_RESPONSE') {
+        return {
+            ...parsed,
+            [schema]: parsed.messageType,
+        } as KVSStatusResponse;
+    }
+
     const messageSchema = Object.prototype.hasOwnProperty.call(kvsMessagePayloadSchemas, parsed.messageType)
         ? parsed.messageType as KVSMessageType
         : 'raw';
+    if (!parsed.messagePayload)
+        throw new Error(`KVS ${parsed.messageType} message is missing messagePayload.`);
+
+    const payload = JSON.parse(Buffer.from(parsed.messagePayload, 'base64').toString('utf8'));
     const messageParser = messageSchema === 'raw' ? raw : kvsMessagePayloadSchemas[messageSchema];
     return {
         ...parsed,
         messagePayload: messageParser.parse(payload),
         [schema]: messageSchema,
     } as KVSResponse;
+}
+
+const kvsCodecRemovalOrder = ['AV1', 'telephone-event', 'CN', 'G722', 'PCMU', 'PCMA'] as const;
+
+function reduceKVSOffer(sdp: string): string {
+    let reducedSdp = sdp;
+    let description: ReturnType<typeof parse> | undefined;
+    for (const codec of kvsCodecRemovalOrder) {
+        if (Buffer.byteLength(serializeKVSMessagePayload({ type: 'offer', sdp: reducedSdp })) <= maxKVSMessagePayloadSize)
+            break;
+
+        description ??= parse(sdp);
+        for (const media of description.media) {
+            const removedPayloads = new Set(media.rtp.flatMap(
+                candidate => candidate.codec === codec ? [candidate.payload] : []
+            ));
+            for (const { payload, config } of media.fmtp) {
+                const { apt } = parseParams(config);
+                if (typeof apt === 'number' && removedPayloads.has(apt))
+                    removedPayloads.add(payload);
+            }
+            if (!removedPayloads.size)
+                continue;
+
+            media.payloads = media.payloads?.split(' ')
+                .filter(payload => !removedPayloads.has(Number(payload)))
+                .join(' ');
+            media.rtp = media.rtp.filter(
+                candidate => !removedPayloads.has(candidate.payload)
+            );
+            media.fmtp = media.fmtp.filter(
+                candidate => !removedPayloads.has(candidate.payload)
+            );
+            media.rtcpFb = media.rtcpFb?.filter(
+                candidate => !removedPayloads.has(candidate.payload as number)
+            );
+            media.rtcpFbTrrInt = media.rtcpFbTrrInt?.filter(
+                candidate => !removedPayloads.has(candidate.payload as number)
+            );
+        }
+        reducedSdp = write(description);
+    }
+
+    return reducedSdp;
 }
 
 export interface KVSSignalingSessionDetails {
@@ -141,10 +222,11 @@ export class KVSRTCSignalingSession implements RTCSignalingSession, RTCSessionCo
         this.candidates = createCandidateQueue(async candidate => {
             await this.sendIceCandidate?.(candidate);
         });
-        await this.sendMessage('SDP_OFFER', {
+        const messagePayload = {
             type: 'offer',
-            sdp: offer.sdp || '',
-        });
+            sdp: reduceKVSOffer(offer.sdp || ''),
+        } as const;
+        await this.sendMessage('SDP_OFFER', messagePayload);
     }
 
     async addIceCandidate(candidate: RTCIceCandidateInit): Promise<void> {
@@ -214,6 +296,12 @@ export class KVSRTCSignalingSession implements RTCSignalingSession, RTCSessionCo
                 case 'ICE_CANDIDATE': {
                     if (message.messagePayload.candidate)
                         await this.candidates?.sendIceCandidate(message.messagePayload);
+                    break;
+                }
+                case 'STATUS_RESPONSE': {
+                    const { statusCode, errorType, description } = message.statusResponse;
+                    const details = [statusCode, errorType, description].filter(Boolean).join(' ');
+                    this.answer?.reject(new Error(`KVS signaling request failed${details ? `: ${details}` : '.'}`));
                     break;
                 }
             }

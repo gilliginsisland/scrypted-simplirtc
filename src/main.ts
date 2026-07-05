@@ -183,6 +183,8 @@ export default class SimpliSafePlugin extends ScryptedDeviceBase implements Devi
 
     async getDevice(nativeId: string): Promise<SimpliSafeCameraDevice> {
         if (!this.devices.has(nativeId)) {
+            if (!this.cameras.has(nativeId) && this.refreshPromise)
+                await this.refreshPromise;
             const camera = this.cameras.get(nativeId);
             if (!camera)
                 throw new Error(`Unknown SimpliSafe camera nativeId=${nativeId}.`);
