@@ -1,5 +1,5 @@
 import { z } from 'zod';
-import type { SimpliSafeApi } from './api';
+import type { SimpliSafeApi, SimpliSafeMedia } from './api';
 
 const liveViewBaseUrl = 'https://app-hub.prd.aser.simplisafe.com/v2';
 
@@ -11,6 +11,28 @@ const cameraSettingsSchema = z.looseObject({
     cameraName: z.string().min(1),
     admin: cameraAdminSchema,
 });
+export function simpliSafeEventSchema(mediaSchema: z.ZodType<SimpliSafeMedia>) {
+    const eventVideoSchema = z.looseObject({
+        _links: z.looseObject({
+            'snapshot/jpg': mediaSchema.optional(),
+        }).optional(),
+    });
+    return z.looseObject({
+        eventCid: z.number().optional(),
+        eventTimestamp: z.number().optional(),
+        info: z.string().min(1).optional(),
+        sid: z.number().optional(),
+        sensorName: z.string().optional(),
+        sensorSerial: z.string().optional(),
+        sensorType: z.union([
+            z.string().min(1),
+            z.number(),
+        ]).optional(),
+        video: z.record(z.string(), eventVideoSchema).nullable().optional(),
+        videoStartedBy: z.string().nullable().optional(),
+    });
+}
+export type SimpliSafeEvent = z.output<ReturnType<typeof simpliSafeEventSchema>>;
 export const cameraSchema = z.looseObject({
     uuid: z.string().min(1),
     serial: z.string().min(1),
@@ -35,11 +57,11 @@ export class SimpliSafeCamera {
     }
 
     get serial(): string {
-        return this.#details.uuid;
+        return this.#details.serial;
     }
 
-    get eventSerials(): readonly string[] {
-        return [this.#details.uuid, this.#details.serial];
+    get uuid(): string {
+        return this.#details.uuid;
     }
 
     get systemId(): number {
@@ -63,17 +85,27 @@ export class SimpliSafeCamera {
     }
 
     async getLiveView<Backend extends SimpliSafeCameraBackend>(backend: Backend): Promise<SimpliSafeLiveView<Backend>> {
-        const liveView = await this.api.request(`cameras/${encodeURIComponent(this.serial)}/${encodeURIComponent(this.systemId.toString())}/live-view`, {
-            baseUrl: liveViewBaseUrl,
-        });
         const liveViewSchema = Object.prototype.hasOwnProperty.call(liveViewParsers, backend)
             ? backend as SimpliSafeKnownCameraBackend
             : 'raw';
         const liveViewParser = liveViewSchema === 'raw' ? raw : liveViewParsers[liveViewSchema];
+        const liveView = await this.api.requestJson(`cameras/${encodeURIComponent(this.uuid)}/${encodeURIComponent(this.systemId.toString())}/live-view`, {
+            baseUrl: liveViewBaseUrl,
+            schema: liveViewParser,
+        });
         return {
-            ...liveViewParser.parse(liveView),
+            ...liveView,
             [schema]: liveViewSchema,
         } as SimpliSafeLiveView<Backend>;
+    }
+
+    async events(): Promise<SimpliSafeEvent[]> {
+        const response = await this.api.requestJson(`subscriptions/${encodeURIComponent(this.systemId.toString())}/events?numEvents=50`, {
+            schema: z.looseObject({
+                events: z.array(simpliSafeEventSchema(this.api.mediaSchema())),
+            }),
+        });
+        return response.events;
     }
 
 }

@@ -13,7 +13,7 @@ export class SimpliSafeSubscription {
     }
 
     async update(): Promise<void> {
-        const { subscription } = await this.api.request(`subscriptions/${encodeURIComponent(this.id.toString())}/`, {
+        const { subscription } = await this.api.requestJson(`subscriptions/${encodeURIComponent(this.id.toString())}/`, {
             schema: subscriptionEnvelopeSchema,
         });
 

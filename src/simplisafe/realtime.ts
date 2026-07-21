@@ -1,14 +1,18 @@
 import { EventEmitter } from 'events';
 import WebSocket, { RawData } from 'ws';
 import { z } from 'zod';
+import type { SimpliSafeApi, SimpliSafeMedia } from './api';
+import { simpliSafeEventSchema } from './camera';
+import type { SimpliSafeEvent } from './camera';
 
 export const simplisafeRealtimeWebsocketUrl = 'wss://socketlink.prd.aser.simplisafe.com';
 const websocketSource = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/15.0 Safari/605.1.15';
 const defaultRealtimePingIntervalMs = 55_000;
 const defaultRealtimeReconnectDelayMs = 5_000;
 const defaultRealtimeWatchdogTimeoutMs = 5 * 60_000;
+export const cameraMotionDetectedEventCid = 1170;
 const eventTypeByCid = new Map<number, string>([
-    [1170, 'camera_motion_detected'],
+    [cameraMotionDetectedEventCid, 'camera_motion_detected'],
 ]);
 
 export interface SimpliSafeRealtimeIdentify {
@@ -32,40 +36,27 @@ interface SimpliSafeRealtimeIdentifyMessage {
     };
 }
 
-export interface SimpliSafeRealtimeEvent {
+export type SimpliSafeRealtimeEvent = SimpliSafeEvent & {
     eventType?: string;
-    eventCid?: number;
-    info?: string;
     systemId?: number;
     timestamp?: Date;
-    sensorName?: string;
-    sensorSerial?: string;
-    sensorType?: string | number;
+    snapshot?: SimpliSafeMedia;
     raw: unknown;
-}
+};
 
 export interface SimpliSafeRealtimeEventMap {
     realtimeEvent: [SimpliSafeRealtimeEvent];
     camera_motion_detected: [SimpliSafeRealtimeEvent];
 }
 
-const realtimeStandardEventSchema = z.looseObject({
-    type: z.literal('com.simplisafe.event.standard'),
-    data: z.looseObject({
-        eventCid: z.number().optional(),
-        eventTimestamp: z.number().optional(),
-        info: z.string().min(1).optional(),
-        sid: z.number().optional(),
-        sensorName: z.string().min(1).optional(),
-        sensorSerial: z.string().min(1).optional(),
-        sensorType: z.union([
-            z.string().min(1),
-            z.number(),
-        ]).optional(),
-    }),
-});
-
 export class SimpliSafeRealtimeEvents extends EventEmitter<SimpliSafeRealtimeEventMap> {
+    private readonly eventSchema: ReturnType<typeof simpliSafeEventSchema>;
+
+    constructor(api: SimpliSafeApi) {
+        super();
+        this.eventSchema = simpliSafeEventSchema(api.mediaSchema());
+    }
+
     hasListeners(): boolean {
         return this.eventNames().some(eventName => this.listenerCount(eventName) > 0);
     }
@@ -83,13 +74,47 @@ export class SimpliSafeRealtimeEvents extends EventEmitter<SimpliSafeRealtimeEve
             return;
         }
 
-        const event = parseRealtimeEvent(payload);
+        const event = this.parseRealtimeEvent(payload);
         if (!event)
             return;
 
         this.emit('realtimeEvent', event);
         if (event.eventType === 'camera_motion_detected')
             this.emit('camera_motion_detected', event);
+    }
+
+    private parseRealtimeEvent(payload: unknown): SimpliSafeRealtimeEvent | undefined {
+        const parsed = z.looseObject({
+            type: z.literal('com.simplisafe.event.standard'),
+            data: this.eventSchema,
+        }).safeParse(payload);
+        if (parsed.success)
+            return this.createRealtimeEvent(parsed.data.data, payload);
+
+        return this.parseRealtimeEventData(payload);
+    }
+
+    private parseRealtimeEventData(data: unknown, raw = data): SimpliSafeRealtimeEvent | undefined {
+        const parsed = this.eventSchema.safeParse(data);
+        if (!parsed.success)
+            return;
+
+        return this.createRealtimeEvent(parsed.data, raw);
+    }
+
+    private createRealtimeEvent(event: SimpliSafeEvent, raw: unknown): SimpliSafeRealtimeEvent {
+        const eventCid = event.eventCid;
+        const timestamp = dateFromEpoch(event.eventTimestamp);
+        return {
+            ...event,
+            eventType: eventCid === undefined ? undefined : eventTypeByCid.get(eventCid),
+            systemId: event.sid,
+            timestamp,
+            snapshot: event.video && event.videoStartedBy
+                ? event.video[event.videoStartedBy]?._links?.['snapshot/jpg']
+                : undefined,
+            raw,
+        };
     }
 }
 
@@ -302,27 +327,6 @@ function rawDataToString(data: RawData): string {
     if (Array.isArray(data))
         return Buffer.concat(data).toString('utf8');
     return Buffer.from(data).toString('utf8');
-}
-
-function parseRealtimeEvent(payload: unknown): SimpliSafeRealtimeEvent | undefined {
-    const parsed = realtimeStandardEventSchema.safeParse(payload);
-    if (!parsed.success)
-        return;
-    const data = parsed.data.data;
-    const eventCid = data.eventCid;
-    const timestamp = dateFromEpoch(data.eventTimestamp);
-    const sensorType = data.sensorType;
-    return {
-        eventType: eventCid === undefined ? undefined : eventTypeByCid.get(eventCid),
-        eventCid,
-        info: data.info,
-        systemId: data.sid,
-        timestamp,
-        sensorName: data.sensorName,
-        sensorSerial: data.sensorSerial,
-        sensorType,
-        raw: payload,
-    };
 }
 
 function dateFromEpoch(value: number | undefined): Date | undefined {

@@ -49,13 +49,6 @@ export default class SimpliSafePlugin extends ScryptedDeviceBase implements Devi
     private cameras = new Map<string, SimpliSafeCamera>();
     private devices = new Map<string, SimpliSafeCameraDevice>();
     private refreshPromise?: Promise<void>;
-    private realtimeEvents = new SimpliSafeRealtimeEvents();
-    private realtimeWatchdog = new SimpliSafeRealtimeWatchdog(this.realtimeEvents, async () => {
-        const userId = await this.api.getUserId();
-        const accessToken = await this.auth.ensureAccessToken();
-        return { accessToken, userId };
-    });
-
     settingsStorage = new StorageSettings(this, {
         redirectUrl: {
             title: 'Redirect URL',
@@ -100,6 +93,12 @@ export default class SimpliSafePlugin extends ScryptedDeviceBase implements Devi
 
     auth = new SimpliSafeAuth(new StorageTokenStore(this.settingsStorage));
     api = new SimpliSafeApi(this.auth);
+    private realtimeEvents = new SimpliSafeRealtimeEvents(this.api);
+    private realtimeWatchdog = new SimpliSafeRealtimeWatchdog(this.realtimeEvents, async () => {
+        const userId = await this.api.getUserId();
+        const accessToken = await this.auth.ensureAccessToken();
+        return { accessToken, userId };
+    });
 
     constructor(nativeId?: string) {
         super(nativeId);
@@ -142,7 +141,7 @@ export default class SimpliSafePlugin extends ScryptedDeviceBase implements Devi
             const cameras = new Map<string, SimpliSafeCamera>();
             for (const subscription of this.api.subscriptions()) {
                 for (const camera of subscription.cameras()) {
-                    const nativeId = `${camera.systemId}:${camera.serial}`;
+                    const nativeId = `${camera.systemId}:${camera.uuid}`;
                     cameras.set(nativeId, camera);
                 }
             }
@@ -155,6 +154,7 @@ export default class SimpliSafePlugin extends ScryptedDeviceBase implements Devi
                         name: camera.name,
                         type: ScryptedDeviceType.Camera,
                         interfaces: [
+                            ScryptedInterface.Camera,
                             ScryptedInterface.MotionSensor,
                             ScryptedInterface.RTCSignalingChannel,
                         ],
@@ -188,7 +188,9 @@ export default class SimpliSafePlugin extends ScryptedDeviceBase implements Devi
             const camera = this.cameras.get(nativeId);
             if (!camera)
                 throw new Error(`Unknown SimpliSafe camera nativeId=${nativeId}.`);
-            this.devices.set(nativeId, new SimpliSafeCameraDevice(this.api, this.realtimeEvents, nativeId, camera));
+            const device = new SimpliSafeCameraDevice(this.api, this.realtimeEvents, nativeId, camera);
+            this.devices.set(nativeId, device);
+            await device.primeSnapshot();
             await this.syncRealtimeWatchdog();
         }
         return this.devices.get(nativeId)!;

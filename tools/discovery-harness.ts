@@ -1,5 +1,6 @@
 import fs from 'fs';
 import path from 'path';
+import { z } from 'zod';
 import { SimpliSafeApi } from '../src/simplisafe/api';
 import { schema } from '../src/simplisafe/camera';
 import type { SimpliSafeCamera } from '../src/simplisafe/camera';
@@ -62,8 +63,8 @@ async function main(): Promise<void> {
     }
     console.log(JSON.stringify(cameras.map(camera => ({
         name: camera.name,
+        uuid: camera.uuid,
         serial: camera.serial,
-        eventSerials: camera.eventSerials,
         systemId: camera.systemId,
         backend: camera.backend,
         model: camera.model,
@@ -116,7 +117,9 @@ async function main(): Promise<void> {
 
 async function inspectSubscriptionSchemas(api: SimpliSafeApi): Promise<void> {
     const userId = await api.getUserId();
-    const summaries = await api.request(`users/${encodeURIComponent(userId.toString())}/subscriptions?activeOnly=false`);
+    const summaries = await api.requestJson(`users/${encodeURIComponent(userId.toString())}/subscriptions?activeOnly=false`, {
+        schema: z.unknown(),
+    });
     const summaryEnvelope = assertRecord(summaries, 'SimpliSafe subscription summaries');
     if (!Array.isArray(summaryEnvelope.subscriptions))
         throw new Error('SimpliSafe subscription summaries must contain a subscriptions array.');
@@ -126,7 +129,9 @@ async function inspectSubscriptionSchemas(api: SimpliSafeApi): Promise<void> {
         const subscription = assertRecord(summary, 'SimpliSafe subscription summary');
         if (typeof subscription.sid !== 'number')
             throw new Error('SimpliSafe subscription summary must contain a numeric sid.');
-        details.push(await api.request(`subscriptions/${encodeURIComponent(subscription.sid.toString())}/`));
+        details.push(await api.requestJson(`subscriptions/${encodeURIComponent(subscription.sid.toString())}/`, {
+            schema: z.unknown(),
+        }));
     }
 
     console.log(JSON.stringify({
