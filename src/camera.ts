@@ -2,20 +2,24 @@ import {
     Camera,
     MediaObject,
     MotionSensor,
+    RequestPictureOptions,
     ResponsePictureOptions,
     RTCSessionControl,
     RTCSignalingChannel,
     RTCSignalingSession,
-    RequestPictureOptions,
 } from '@scrypted/sdk';
 import { SimpliSafeDevice } from './device';
 import { connectRTCSignalingClients } from './rtc/common';
 import { KVSRTCSignalingSession } from './rtc/kvs';
-import { LiveKitRTCSessionControl } from './rtc/livekit';
-import type { SimpliSafeApi, SimpliSafeMedia } from './simplisafe/api';
-import type { SimpliSafeCamera } from './simplisafe/camera';
-import { cameraMotionDetectedEventCid } from './simplisafe/realtime';
-import type { SimpliSafeRealtimeEvent, SimpliSafeRealtimeEvents } from './simplisafe/realtime';
+import { LiveKitSession } from './rtc/livekit';
+import {
+    CAMERA_MOTION_DETECTED_EVENT_CID,
+    type SimpliSafeApi,
+    type SimpliSafeCamera,
+    type SimpliSafeMedia,
+    type SimpliSafeRealtimeEvent,
+    type SimpliSafeRealtimeEvents,
+} from './simplisafe';
 
 const motionHoldMs = 30_000;
 
@@ -48,7 +52,7 @@ export class SimpliSafeCameraDevice extends SimpliSafeDevice implements Camera, 
         try {
             for (const event of (await this.camera.events()).sort((left, right) =>
                 (right.eventTimestamp ?? 0) - (left.eventTimestamp ?? 0))) {
-                if (event.eventCid !== cameraMotionDetectedEventCid
+                if (event.eventCid !== CAMERA_MOTION_DETECTED_EVENT_CID
                     || !event.sensorSerial
                     || !this.eventSerials.includes(event.sensorSerial))
                     continue;
@@ -109,30 +113,37 @@ export class SimpliSafeCameraDevice extends SimpliSafeDevice implements Camera, 
             case 'kvs': {
                 const liveView = await this.camera.getLiveView('kvs');
                 const kvsSession = new KVSRTCSignalingSession(liveView);
-                await connectRTCSignalingClients(session, {
-                    configuration: {
-                        iceServers: liveView.iceServers,
-                    },
-                    audio: {
-                        direction: 'sendrecv',
-                    },
-                    video: {
-                        direction: 'recvonly',
-                    },
-                    getUserMediaSafariHack: true,
-                }, kvsSession, {}).catch(error => {
-                    this.console.error('Failed to negotiate SimpliSafe KVS session.', error);
-                    return kvsSession.endSession();
-                });
+                try {
+                    await connectRTCSignalingClients(session, {
+                        configuration: {
+                            iceServers: liveView.iceServers,
+                        },
+                        audio: {
+                            direction: 'sendrecv',
+                        },
+                        video: {
+                            direction: 'recvonly',
+                        },
+                        getUserMediaSafariHack: true,
+                    }, kvsSession, {});
+                } catch (err) {
+                    kvsSession.endSession();
+                    throw err;
+                }
                 return kvsSession;
             }
             case 'mist': {
                 const liveView = await this.camera.getLiveView('mist');
-                return LiveKitRTCSessionControl.start(
+                const liveKitSession = await LiveKitSession.start(
                     liveView.liveKitDetails.liveKitURL,
                     liveView.liveKitDetails.userToken,
-                    session,
                 );
+                try {
+                    return await liveKitSession.connectSignalingClient(session);
+                } catch (err) {
+                    liveKitSession.close()
+                    throw err;
+                }
             }
             default:
                 throw new Error('Unsupported SimpliSafe live-view backend.');

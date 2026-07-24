@@ -10,9 +10,9 @@ const websocketSource = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWe
 const defaultRealtimePingIntervalMs = 55_000;
 const defaultRealtimeReconnectDelayMs = 5_000;
 const defaultRealtimeWatchdogTimeoutMs = 5 * 60_000;
-export const cameraMotionDetectedEventCid = 1170;
+export const CAMERA_MOTION_DETECTED_EVENT_CID = 1170;
 const eventTypeByCid = new Map<number, string>([
-    [cameraMotionDetectedEventCid, 'camera_motion_detected'],
+    [CAMERA_MOTION_DETECTED_EVENT_CID, 'camera_motion_detected'],
 ]);
 
 export interface SimpliSafeRealtimeIdentify {

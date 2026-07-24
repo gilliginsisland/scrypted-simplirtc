@@ -11,10 +11,15 @@ import sdk, {
 } from '@scrypted/sdk';
 import { StorageSettings } from '@scrypted/sdk/storage-settings';
 import { SimpliSafeCameraDevice } from './camera';
-import { SimpliSafeApi } from './simplisafe/api';
-import type { SimpliSafeCamera } from './simplisafe/camera';
-import { SimpliSafeAuth, SimpliSafeTokenState, SimpliSafeTokenStore } from './simplisafe/oauth';
-import { SimpliSafeRealtimeEvents, SimpliSafeRealtimeWatchdog } from './simplisafe/realtime';
+import {
+    SimpliSafeApi,
+    SimpliSafeAuth,
+    SimpliSafeRealtimeEvents,
+    SimpliSafeRealtimeWatchdog,
+    type SimpliSafeCamera,
+    type SimpliSafeTokenState,
+    type SimpliSafeTokenStore,
+} from './simplisafe';
 
 const { deviceManager } = sdk;
 
@@ -53,7 +58,7 @@ export default class SimpliSafePlugin extends ScryptedDeviceBase implements Devi
         redirectUrl: {
             title: 'Redirect URL',
             description: 'Paste the final SimpliSafe mobile redirect URL here after opening the Login URL.',
-            type: 'textarea',
+            type: 'string',
             noStore: true,
             onPut: async (_oldValue: unknown, newValue: unknown) => {
                 const redirectUrl = newValue?.toString().trim();

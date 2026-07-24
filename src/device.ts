@@ -1,6 +1,10 @@
 import { ScryptedDeviceBase } from '@scrypted/sdk';
-import type { SimpliSafeApi } from './simplisafe/api';
-import type { SimpliSafeRealtimeEvent, SimpliSafeRealtimeEventMap, SimpliSafeRealtimeEvents } from './simplisafe/realtime';
+import type {
+    SimpliSafeApi,
+    SimpliSafeRealtimeEvent,
+    SimpliSafeRealtimeEventMap,
+    SimpliSafeRealtimeEvents,
+} from './simplisafe';
 
 export abstract class SimpliSafeDevice extends ScryptedDeviceBase {
     private realtimeListenerRemovers: (() => void)[] = [];

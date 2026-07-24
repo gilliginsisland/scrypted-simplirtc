@@ -5,293 +5,240 @@ import {
     JoinRequest,
     JoinResponse,
     MediaSectionsRequirement,
+    ParticipantUpdate,
     Ping,
     SessionDescription,
     SignalRequest,
     SignalResponse,
     SignalTarget,
+    SubscriptionPermissionUpdate,
+    TrackSource,
+    TrackType,
     TrickleRequest,
     WrappedJoinRequest,
     WrappedJoinRequest_Compression,
 } from '@livekit/protocol';
 import { RTCAVSignalingSetup, RTCSessionControl, RTCSignalingSession } from '@scrypted/sdk';
-import { EventEmitter } from 'events';
-import type { IncomingMessage } from 'http';
-import WebSocket, { type RawData } from 'ws';
+import type { Duplex } from 'stream';
+import { RTCIceCandidate, RTCPeerConnection } from 'werift';
+import WebSocket from 'ws';
 import { gzipSync } from 'zlib';
-import { createCandidateQueue, Deferred, getRTCSignalingOptions } from './common';
+import { createCandidateQueue, Deferred } from './common';
 
 const liveKitProtocolVersion = 16;
 const liveKitSdkVersion = '1.0.17';
 
-export interface LiveKitSignalingCloseEvent extends Pick<ErrorEvent, 'message' | 'error'> {
-    code: number;
-    reason: string;
-}
-
 export interface LiveKitSignalingOptions {
-    token: string;
-    joinRequest: string;
+    token?: string;
+    joinRequest?: JoinRequest;
 }
 
-export class LiveKitSignaling extends EventEmitter {
-    private ws: WebSocket;
-    private pingTimer?: NodeJS.Timeout;
-    private closed = false;
-    private messageChain: Promise<void> = Promise.resolve();
+export type LiveKitSignalMessage = SignalResponse['message'];
+type LiveKitSignalRequestMessage = Exclude<SignalRequest['message'], { case: undefined }>;
 
-    constructor(liveKitURL: string, options: LiveKitSignalingOptions) {
-        super();
-        this.ws = new WebSocket(createLiveKitEndpoint(liveKitURL, options), createWebSocketOptions(options));
+export class LiveKitSignaling implements AsyncIterable<LiveKitSignalMessage> {
+    private readonly answers = new Map<number, Deferred<SessionDescription>>();
+    private readonly messageStream: Duplex;
+    private nextOfferId = 1;
+    private pingTimer: NodeJS.Timeout | null = null;
 
-        this.ws.on('close', (code, reason) => {
-            this.clearPing();
-            this.closed = true;
-            const reasonText = reason.toString();
-            const message = `LiveKit signaling closed: code=${code} reason=${reasonText}`;
-            const event: LiveKitSignalingCloseEvent = {
-                code,
-                reason: reasonText,
-                message,
-                error: new Error(message),
-            };
-            this.emitEventLater('close', event);
+    static createMessageStream(server: string, options: LiveKitSignalingOptions = {}): LiveKitSignaling {
+        const joinRequest = options.joinRequest ?? new JoinRequest({
+            clientInfo: new ClientInfo({
+                sdk: ClientInfo_SDK.JS,
+                version: liveKitSdkVersion,
+                protocol: liveKitProtocolVersion,
+                clientProtocol: liveKitProtocolVersion,
+            }),
+            connectionSettings: new ConnectionSettings({
+                autoSubscribe: true,
+            }),
         });
-        this.ws.on('error', e => this.emitEventLater('error', e));
-        this.ws.on('message', data => this.enqueueMessage(data));
-        this.ws.on('unexpected-response', (_request, response) => this.onUnexpectedResponse(response));
+        const endpoint = new URL('/rtc', server);
+        const wrapped = new WrappedJoinRequest({
+            compression: WrappedJoinRequest_Compression.GZIP,
+            joinRequest: gzipSync(Buffer.from(joinRequest.toBinary())),
+        });
+        endpoint.searchParams.set(
+            'join_request',
+            Buffer.from(wrapped.toBinary())
+                .toString('base64')
+                .replace(/\+/g, '-')
+                .replace(/\//g, '_'),
+        );
+        const ws = new WebSocket(endpoint, {
+            headers: options.token ? {
+                Authorization: `Bearer ${options.token}`,
+            } : {},
+        });
+        return new LiveKitSignaling(ws);
     }
 
-    async close(): Promise<void> {
-        this.closed = true;
-        this.clearPing();
-        if (this.ws.readyState !== WebSocket.CLOSED && this.ws.readyState !== WebSocket.CLOSING)
-            this.ws.close();
+    constructor(ws: WebSocket) {
+        this.messageStream = WebSocket.createWebSocketStream(ws, { readableObjectMode: true });
+        this.messageStream.on('end', () => void this.close());
+        this.messageStream.on('error', () => void this.close());
     }
 
-    sendOffer(offerId: number, offer: RTCSessionDescriptionInit): void {
-        this.sendRequest(new SignalRequest({
-            message: {
-                case: 'offer',
-                value: new SessionDescription({
-                    id: offerId,
-                    type: offer.type,
-                    sdp: offer.sdp || '',
-                }),
-            },
-        }));
+    close(): void {
+        this.stopPing();
+        for (const answer of this.answers.values()) {
+            void answer.promise.catch(() => {});
+            answer.reject(new Error('LiveKit signaling closed before answering the offer.'));
+        }
+        this.answers.clear();
+        if (!this.messageStream.destroyed && !this.messageStream.writableEnded)
+            this.messageStream.end();
     }
 
-    sendIceCandidate(candidate: RTCIceCandidateInit): void {
-        if (!candidate?.candidate)
-            return;
-
-        this.sendRequest(new SignalRequest({
-            message: {
-                case: 'trickle',
-                value: new TrickleRequest({
-                    candidateInit: JSON.stringify(candidate),
-                    target: SignalTarget.PUBLISHER,
-                }),
-            },
-        }));
+    [Symbol.asyncIterator](): AsyncIterator<LiveKitSignalMessage> {
+        return this.messages({ destroyOnReturn: false });
     }
 
-    private async onMessage(data: RawData): Promise<void> {
-        const response = SignalResponse.fromBinary(rawDataToBytes(data));
-        const message = response.message;
-
-        switch (message.case) {
-            case 'join':
+    async *messages(...options: Parameters<Duplex['iterator']>): AsyncGenerator<LiveKitSignalMessage> {
+        for await (const data of this.messageStream.iterator(...options)) {
+            const message = SignalResponse.fromBinary(data).message;
+            if (message.case === 'join')
                 this.startPing(message.value);
-                await this.emitEvent('join', message.value);
-                break;
-            case 'answer':
-                await this.emitEvent('answer', message.value);
-                break;
-            case 'trickle':
-                await this.emitEvent('trickle', message.value);
-                break;
-            case 'mediaSectionsRequirement':
-                await this.emitEvent('mediaSectionsRequirement', message.value);
-                break;
-            case 'leave':
-                await this.emitEvent('leave');
-                break;
-            case 'pongResp':
-                break;
-            default:
-                break;
+            if (message.case === 'answer') {
+                const answer = this.answers.get(message.value.id);
+                if (answer) {
+                    this.answers.delete(message.value.id);
+                    answer.resolve(message.value);
+                }
+            }
+            yield message;
         }
     }
 
-    private enqueueMessage(data: RawData): void {
-        this.messageChain = this.messageChain
-            .then(() => this.onMessage(data))
-            .catch(e => this.notifyError(e));
+    sendOffer(offer: RTCSessionDescriptionInit): Promise<SessionDescription> {
+        const id = this.nextOfferId++;
+        const answer = new Deferred<SessionDescription>();
+        this.answers.set(id, answer);
+        this.sendRequest('offer', new SessionDescription({
+            id,
+            type: offer.type,
+            sdp: offer.sdp || '',
+        }));
+        return answer.promise;
+    }
+
+    sendIceCandidate(candidate: RTCIceCandidateInit): void {
+        this.sendRequest('trickle', new TrickleRequest({
+            candidateInit: JSON.stringify(candidate),
+            target: SignalTarget.PUBLISHER,
+        }));
+    }
+
+    private sendRequest<Case extends LiveKitSignalRequestMessage['case']>(
+        messageCase: Case,
+        value: Extract<LiveKitSignalRequestMessage, { case: Case }>['value'],
+    ): void {
+        const message = { case: messageCase, value } as LiveKitSignalRequestMessage;
+        this.messageStream.write(Buffer.from(new SignalRequest({ message }).toBinary()));
     }
 
     private startPing(join: JoinResponse): void {
         if (join.pingInterval <= 0)
             return;
 
-        this.clearPing();
+        this.stopPing();
         this.pingTimer = setInterval(() => {
-            this.sendRequest(new SignalRequest({
-                message: {
-                    case: 'pingReq',
-                    value: new Ping({
-                        timestamp: BigInt(Date.now()),
-                    }),
-                },
+            this.sendRequest('pingReq', new Ping({
+                timestamp: BigInt(Date.now()),
             }));
         }, join.pingInterval * 1000);
     }
 
-    private sendRequest(request: SignalRequest): void {
-        if (!this.ws || this.ws.readyState !== WebSocket.OPEN)
-            return;
-        this.ws.send(Buffer.from(request.toBinary()));
-    }
-
-    private clearPing(): void {
-        if (this.pingTimer) {
-            clearInterval(this.pingTimer);
-            this.pingTimer = undefined;
+    private stopPing(): void {
+        if (this.pingTimer === null) {
+            return
         }
-    }
-
-    private notifyError(error: unknown): void {
-        this.emitEventLater('error', error);
-    }
-
-    private onUnexpectedResponse(response: IncomingMessage): void {
-        const chunks: Buffer[] = [];
-        response.on('data', chunk => chunks.push(Buffer.from(chunk)));
-        response.on('end', () => {
-            const status = `${response.statusCode ?? 'unknown'} ${response.statusMessage ?? ''}`.trim();
-            const body = Buffer.concat(chunks).toString('utf8').trim();
-            const suffix = body ? ` body=${body.slice(0, 1000)}` : '';
-            this.notifyError(new Error(`LiveKit signaling unexpected response: status=${status}${suffix}`));
-            this.close().catch(e => this.notifyError(e));
-        });
-        response.on('error', e => this.notifyError(e));
-    }
-
-    private emitEventLater(eventName: string, ...args: unknown[]): void {
-        this.emitEvent(eventName, ...args)
-            .catch(e => {
-                if (eventName !== 'error')
-                    this.emitEventLater('error', e);
-            });
-    }
-
-    private async emitEvent(eventName: string, ...args: unknown[]): Promise<void> {
-        const listeners = this.rawListeners(eventName);
-        if (!listeners.length)
-            return;
-
-        for (const listener of listeners)
-            await (listener as (...args: unknown[]) => void | Promise<void>)(...args);
+        clearInterval(this.pingTimer);
+        this.pingTimer = null;
     }
 }
 
-function createLiveKitEndpoint(liveKitURL: string, options: LiveKitSignalingOptions): string {
-    const endpoint = new URL('rtc', liveKitURL.endsWith('/') ? liveKitURL : `${liveKitURL}/`);
-    endpoint.searchParams.set('join_request', options.joinRequest);
-    return endpoint.toString();
-}
+type CameraTrack = `${TrackType}:${TrackSource}`;
 
-function createWebSocketOptions(options: LiveKitSignalingOptions): WebSocket.ClientOptions {
-    return {
-        headers: {
-            Authorization: `Bearer ${options.token}`,
-        },
-    };
-}
-
-function rawDataToBytes(data: RawData): Uint8Array {
-    if (Buffer.isBuffer(data))
-        return data;
-    if (data instanceof ArrayBuffer)
-        return new Uint8Array(data);
-    if (Array.isArray(data))
-        return Buffer.concat(data);
-    return new Uint8Array(data);
-}
-
-export class LiveKitRTCSessionControl implements RTCSessionControl {
-    private readonly ready = new Deferred<void>();
+class LiveKitWarmup {
+    private readonly peerConnection: RTCPeerConnection;
     private readonly remoteCandidates;
-    private setup?: RTCAVSignalingSetup;
-    private nextOfferId = 1;
-    private renegotiation: Promise<void> = Promise.resolve();
-    private closed = false;
+    private readonly requiredTracks = new Map<CameraTrack, string | null>();
+    private readonly trackPermissions = new Map<string, boolean>();
 
-    private constructor(
+    constructor(
         private readonly signaling: LiveKitSignaling,
-        private readonly session: RTCSignalingSession,
-        private readonly trickleCandidates: boolean,
+        iceServers: JoinResponse['iceServers'],
     ) {
-        this.remoteCandidates = createCandidateQueue(candidate => this.session.addIceCandidate(candidate));
-
-        this.signaling.on('join', join => this.onJoin(join));
-        this.signaling.on('answer', answer => this.onAnswer(answer));
-        this.signaling.on('trickle', trickle => this.onTrickle(trickle));
-        this.signaling.on('mediaSectionsRequirement', requirement => this.onMediaSectionsRequirement(requirement));
-        this.signaling.on('leave', () => this.endSession());
-        this.signaling.on('close', event => this.onClose(event));
-        this.signaling.on('error', error => this.onError(error));
-    }
-
-    static async start(liveKitURL: string, token: string, session: RTCSignalingSession): Promise<LiveKitRTCSessionControl> {
-        const options = await getRTCSignalingOptions(session);
-        const signaling = new LiveKitSignaling(liveKitURL, {
-            token,
-            joinRequest: createWrappedJoinRequest(),
+        this.peerConnection = new RTCPeerConnection({
+            iceServers: iceServers.flatMap(
+                iceServer => iceServer.urls.map(
+                    url => ({
+                        urls: url,
+                        username: iceServer.username || undefined,
+                        credential: iceServer.credential || undefined,
+                    })
+                )
+            ),
         });
-        const control = new LiveKitRTCSessionControl(signaling, session, !options.disableTrickle);
+        this.peerConnection.onIceCandidate.subscribe(candidate => {
+            if (candidate)
+                this.signaling.sendIceCandidate(candidate.toJSON());
+        });
+        this.remoteCandidates = createCandidateQueue(
+            candidate => this.peerConnection.addIceCandidate(
+                new RTCIceCandidate({
+                    candidate: candidate.candidate,
+                    sdpMid: candidate.sdpMid ?? undefined,
+                    sdpMLineIndex: candidate.sdpMLineIndex ?? undefined,
+                })
+            )
+        );
+    }
 
+    async waitForTrackPermissions(requiredTracks: ReadonlyMap<CameraTrack, 'audio' | 'video'>): Promise<void> {
         try {
-            await control.ready.promise;
-            return control;
+            for (const [track, kind] of requiredTracks) {
+                this.requiredTracks.set(track, null);
+                this.peerConnection.addTransceiver(kind, { direction: 'recvonly' });
+            }
+            await this.sendOffer();
+            for await (const message of this.signaling) {
+                switch (message.case) {
+                    case 'answer':
+                        await this.onAnswer(message.value);
+                        break;
+                    case 'trickle':
+                        await this.onTrickle(message.value);
+                        break;
+                    case 'update':
+                        this.onParticipantUpdate(message.value);
+                        break;
+                    case 'subscriptionPermissionUpdate':
+                        this.onSubscriptionPermissionUpdate(message.value);
+                        break;
+                    case 'mediaSectionsRequirement':
+                        await this.sendOffer();
+                        break;
+                    case 'leave':
+                        throw new Error('LiveKit left during media warmup.');
+                }
+                if (!this.requiredTracks.size)
+                    return;
+            }
+            throw new Error('LiveKit signaling closed during media warmup.');
         }
-        catch (e) {
-            await control.endSession();
-            throw e;
+        finally {
+            await this.peerConnection.close();
         }
-    }
-
-    async getRefreshAt(): Promise<number | void> {
-    }
-
-    async extendSession(): Promise<void> {
-    }
-
-    async setPlayback(_options: { audio: boolean; video: boolean }): Promise<void> {
-    }
-
-    async endSession(): Promise<void> {
-        if (this.closed)
-            return;
-        this.closed = true;
-        await this.signaling.close();
-    }
-
-    private async onJoin(join: JoinResponse): Promise<void> {
-        if (this.setup)
-            return;
-
-        this.setup = createSetup(join);
-        await this.sendOffer();
-        this.ready.resolve();
     }
 
     private async onAnswer(answer: SessionDescription): Promise<void> {
-        if (!this.setup)
-            return;
-
-        await this.session.setRemoteDescription(toRTCSessionDescription(answer), this.setup);
+        await this.peerConnection.setRemoteDescription({
+            type: answer.type as 'offer' | 'answer',
+            sdp: answer.sdp,
+        });
         await this.remoteCandidates.flush();
     }
 
@@ -311,89 +258,224 @@ export class LiveKitRTCSessionControl implements RTCSessionControl {
         await this.remoteCandidates.sendIceCandidate(candidate);
     }
 
-    private onMediaSectionsRequirement(requirement: MediaSectionsRequirement): Promise<void> {
-        if (!requirement.numAudios && !requirement.numVideos)
-            return Promise.resolve();
+    private onParticipantUpdate(update: ParticipantUpdate): void {
+        for (const participant of update.participants) {
+            if (!participant.isPublisher)
+                continue;
+            for (const track of participant.tracks) {
+                const cameraTrack = `${track.type}:${track.source}` as CameraTrack;
+                if (!track.sid || !this.requiredTracks.has(cameraTrack))
+                    continue;
 
-        this.renegotiation = this.renegotiation.then(() => this.sendOffer());
-        return this.renegotiation;
+                if (this.trackPermissions.get(track.sid))
+                    this.requiredTracks.delete(cameraTrack);
+                else
+                    this.requiredTracks.set(cameraTrack, track.sid);
+            }
+        }
     }
 
-    private onClose(event: LiveKitSignalingCloseEvent): void {
-        this.ready.reject(event.error);
-        this.closed = true;
-    }
+    private onSubscriptionPermissionUpdate(update: SubscriptionPermissionUpdate): void {
+        this.trackPermissions.set(update.trackSid, update.allowed);
+        if (!update.allowed)
+            return;
 
-    private onError(error: unknown): void {
-        this.ready.reject(error);
-        void this.endSession();
+        for (const [cameraTrack, trackSid] of this.requiredTracks) {
+            if (trackSid === update.trackSid) {
+                this.requiredTracks.delete(cameraTrack);
+                return;
+            }
+        }
     }
 
     private async sendOffer(): Promise<void> {
-        if (this.closed)
-            return;
-        if (!this.setup)
-            throw new Error('LiveKit joined without an RTC setup.');
+        const offer = await this.peerConnection.createOffer();
+        const localDescription = (await this.peerConnection.setLocalDescription(offer)).toJSON();
+        this.signaling.sendOffer(localDescription);
+    }
+}
 
+export class LiveKitSession {
+    private constructor(
+        readonly signaling: LiveKitSignaling,
+        readonly iceServers: JoinResponse['iceServers'],
+    ) {
+    }
+
+    static async start(liveKitURL: string, token: string): Promise<LiveKitSession> {
+        const requiredCameraTracks: ReadonlyMap<CameraTrack, 'audio' | 'video'> = new Map([
+            [`${TrackType.AUDIO}:${TrackSource.MICROPHONE}`, 'audio'],
+            [`${TrackType.VIDEO}:${TrackSource.CAMERA}`, 'video'],
+        ]);
+        for (let attempt = 0; attempt < 2; attempt++) {
+            const signaling = LiveKitSignaling.createMessageStream(liveKitURL, { token });
+            try {
+                const joinResponse = await this.waitForJoin(signaling);
+                const cameraTracks = new Set<CameraTrack>();
+                for (const participant of joinResponse.otherParticipants) {
+                    if (!participant.isPublisher)
+                        continue;
+                    for (const track of participant.tracks) {
+                        const cameraTrack = `${track.type}:${track.source}` as CameraTrack;
+                        if (requiredCameraTracks.has(cameraTrack))
+                            cameraTracks.add(cameraTrack);
+                    }
+                }
+                if (cameraTracks.size === requiredCameraTracks.size)
+                    return new LiveKitSession(signaling, joinResponse.iceServers);
+                if (attempt) {
+                    throw new Error(
+                        `LiveKit joined with ${cameraTracks.size} of ${requiredCameraTracks.size} required camera tracks after media warmup.`,
+                    );
+                }
+                try {
+                    await new LiveKitWarmup(signaling, joinResponse.iceServers).waitForTrackPermissions(requiredCameraTracks);
+                } catch (error) {
+                    console.warn('LiveKit media warmup failed; continuing with browser signaling.', error);
+                }
+                signaling.close();
+            } catch (error) {
+                signaling.close();
+                throw error;
+            }
+        }
+        throw new Error('LiveKit did not create a browser signaling session.');
+    }
+
+    close(): void {
+        this.signaling.close();
+    }
+
+    async connectSignalingClient(session: RTCSignalingSession): Promise<LiveKitRTCSessionControl> {
+        const control = new LiveKitRTCSessionControl(this);
+        await control.connect(session);
+        return control;
+    }
+
+    private static async waitForJoin(signaling: LiveKitSignaling): Promise<JoinResponse> {
+        for await (const message of signaling) {
+            if (message.case === 'join')
+                return message.value;
+            if (message.case === 'leave')
+                throw new Error('LiveKit left before joining.');
+        }
+        throw new Error('LiveKit signaling closed before joining.');
+    }
+}
+
+export class LiveKitRTCSessionControl implements RTCSessionControl {
+    private remoteCandidates!: ReturnType<typeof createCandidateQueue>;
+    private readonly setup: RTCAVSignalingSetup;
+    private session!: RTCSignalingSession;
+
+    constructor(private readonly liveKitSession: LiveKitSession) {
+        this.setup = {
+            type: 'offer',
+            configuration: {
+                iceServers: this.liveKitSession.iceServers.map(iceServer => ({
+                    urls: iceServer.urls,
+                    username: iceServer.username || undefined,
+                    credential: iceServer.credential || undefined,
+                })),
+            },
+            audio: {
+                direction: 'recvonly',
+            },
+            video: {
+                direction: 'recvonly',
+            },
+        };
+    }
+
+    async connect(session: RTCSignalingSession): Promise<void> {
+        if (this.session)
+            throw new Error('LiveKit signaling client is already connected.');
+
+        this.session = session;
+        this.remoteCandidates = createCandidateQueue(candidate => session.addIceCandidate(candidate));
+        const messageLoop = this.receiveMessages();
+        void messageLoop
+            .catch(error => console.error('LiveKit signaling session failed.', error))
+            .finally(() => this.endSession());
+        const answer = await Promise.race([
+            this.sendOffer(),
+            messageLoop.then(() => {
+                throw new Error('LiveKit signaling closed before answering the browser offer.');
+            }),
+        ]);
+        await this.session.setRemoteDescription({
+            type: answer.type as RTCSdpType,
+            sdp: answer.sdp,
+        }, this.setup);
+        await this.remoteCandidates.flush();
+    }
+
+    private async receiveMessages(): Promise<void> {
+        for await (const message of this.liveKitSession.signaling) {
+            switch (message.case) {
+                case 'trickle':
+                    await this.onTrickle(message.value);
+                    break;
+                case 'mediaSectionsRequirement':
+                    await this.onMediaSectionsRequirement(message.value);
+                    break;
+                case 'leave':
+                    return;
+            }
+        }
+    }
+
+    private async onTrickle(trickle: TrickleRequest): Promise<void> {
+        if (trickle.target !== SignalTarget.PUBLISHER || !trickle.candidateInit)
+            return;
+
+        let candidate: RTCIceCandidateInit;
+        try {
+            candidate = JSON.parse(trickle.candidateInit) as RTCIceCandidateInit;
+        }
+        catch {
+            return;
+        }
+        if (!candidate.candidate)
+            return;
+        await this.remoteCandidates.sendIceCandidate(candidate);
+    }
+
+    private async onMediaSectionsRequirement(requirement: MediaSectionsRequirement): Promise<void> {
+        if (requirement.numAudios || requirement.numVideos) {
+            throw new Error(
+                `LiveKit requested additional media sections: audio=${requirement.numAudios} video=${requirement.numVideos}.`,
+            );
+        }
+
+        void this.sendOffer();
+    }
+
+    private async sendOffer(): Promise<SessionDescription> {
         const candidates = createCandidateQueue(candidate => {
-            this.signaling.sendIceCandidate(candidate);
+            this.liveKitSession.signaling.sendIceCandidate(candidate);
             return Promise.resolve();
         });
         const offer = await this.session.createLocalDescription(
             'offer',
             this.setup,
-            this.trickleCandidates ? candidates.sendIceCandidate : undefined,
+            this.session.options.disableTrickle ? undefined : candidates.sendIceCandidate,
         );
-        this.signaling.sendOffer(this.nextOfferId++, offer);
+        const answer = this.liveKitSession.signaling.sendOffer(offer);
         await candidates.flush();
+        return answer;
     }
-}
 
-function createSetup(join: JoinResponse): RTCAVSignalingSetup {
-    return {
-        type: 'offer',
-        configuration: {
-            iceServers: join.iceServers.map(iceServer => ({
-                urls: iceServer.urls,
-                username: iceServer.username || undefined,
-                credential: iceServer.credential || undefined,
-            })),
-        },
-        audio: {
-            direction: 'recvonly',
-        },
-        video: {
-            direction: 'recvonly',
-        },
-        getUserMediaSafariHack: true,
-    };
-}
+    async getRefreshAt(): Promise<number | void> {
+    }
 
-function createWrappedJoinRequest(): string {
-    const joinRequest = new JoinRequest({
-        clientInfo: new ClientInfo({
-            sdk: ClientInfo_SDK.JS,
-            version: liveKitSdkVersion,
-            protocol: liveKitProtocolVersion,
-            clientProtocol: liveKitProtocolVersion,
-        }),
-        connectionSettings: new ConnectionSettings({
-            autoSubscribe: true,
-        }),
-    });
-    const wrapped = new WrappedJoinRequest({
-        compression: WrappedJoinRequest_Compression.GZIP,
-        joinRequest: gzipSync(Buffer.from(joinRequest.toBinary())),
-    });
-    return Buffer.from(wrapped.toBinary())
-        .toString('base64')
-        .replace(/\+/g, '-')
-        .replace(/\//g, '_');
-}
+    async extendSession(): Promise<void> {
+    }
 
-function toRTCSessionDescription(description: SessionDescription): RTCSessionDescriptionInit {
-    return {
-        type: description.type as RTCSdpType,
-        sdp: description.sdp,
-    };
+    async setPlayback(_options: { audio: boolean; video: boolean }): Promise<void> {
+    }
+
+    async endSession(): Promise<void> {
+        this.liveKitSession.close();
+    }
 }

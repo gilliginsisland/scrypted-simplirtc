@@ -1,6 +1,5 @@
 import {
     RTCAVSignalingSetup,
-    RTCSignalingOptions,
     RTCSignalingSendIceCandidate,
     RTCSignalingSession,
 } from '@scrypted/sdk';
@@ -44,20 +43,14 @@ export function createCandidateQueue(send: RTCSignalingSendIceCandidate): {
     };
 }
 
-export async function getRTCSignalingOptions(session: RTCSignalingSession): Promise<RTCSignalingOptions> {
-    return session.options || await session.getOptions();
-}
-
 export async function connectRTCSignalingClients(
     offerSession: RTCSignalingSession,
     offerSetup: Partial<RTCAVSignalingSetup>,
     answerSession: RTCSignalingSession,
     answerSetup: Partial<RTCAVSignalingSetup>,
 ): Promise<void> {
-    const [offerOptions, answerOptions] = await Promise.all([
-        getRTCSignalingOptions(offerSession),
-        getRTCSignalingOptions(answerSession),
-    ]);
+    const { options: offerOptions } = offerSession;
+    const { options: answerOptions } = answerSession;
     if (offerOptions.offer && answerOptions.offer)
         throw new Error('Both RTC clients have offers and can not negotiate.');
     if (offerOptions.requiresOffer && answerOptions.requiresOffer)
