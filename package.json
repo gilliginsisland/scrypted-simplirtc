@@ -26,24 +26,7 @@
    ],
    "license": "MIT",
    "scripts": {
-      "scrypted-setup-project": "scrypted-setup-project",
-      "prescrypted-setup-project": "scrypted-package-json",
-      "build": "scrypted-webpack",
-      "preprepublishOnly": "scrypted-changelog",
-      "prepublishOnly": "NODE_ENV=production scrypted-webpack",
-      "prescrypted-vscode-launch": "scrypted-webpack",
-      "scrypted-vscode-launch": "scrypted-deploy-debug",
-      "scrypted-deploy-debug": "scrypted-deploy-debug",
-      "scrypted-debug": "scrypted-debug",
-      "scrypted-deploy": "scrypted-deploy",
-      "scrypted-changelog": "scrypted-changelog",
-      "scrypted-package-json": "scrypted-package-json",
-      "check": "tsc --noEmit",
-      "harness:auth-url": "tsx tools/discovery-harness.ts --auth-url",
-      "harness:discovery": "tsx tools/discovery-harness.ts",
-      "harness:live-view": "tsx tools/discovery-harness.ts --live-view",
-      "harness:schema-shapes": "tsx tools/discovery-harness.ts --schema-shapes",
-      "scrypted-readme": "scrypted-readme"
+      "check": "tsc --noEmit"
    },
    "scrypted": {
       "name": "SimpliSafe Cameras",
@@ -69,7 +52,6 @@
       "@types/node": "^20.14.10",
       "@types/sdp-transform": "^3.0.0",
       "@types/ws": "^8.5.10",
-      "tsx": "^4.19.0",
       "typescript": "^5.5.4"
    }
 }
