@@ -1,5 +1,5 @@
 {
-   "name": "@gilliginsisland/scrypted-simplisafe",
+   "name": "@gilliginsisland/scrypted-simplirtc",
    "version": "0.0.1",
    "description": "Native SimpliSafe camera plugin for Scrypted.",
    "type": "commonjs",
@@ -11,12 +11,12 @@
    ],
    "repository": {
       "type": "git",
-      "url": "git+https://github.com/gilliginsisland/scrypted-simplisafe.git"
+      "url": "git+https://github.com/gilliginsisland/scrypted-simplirtc.git"
    },
    "bugs": {
-      "url": "https://github.com/gilliginsisland/scrypted-simplisafe/issues"
+      "url": "https://github.com/gilliginsisland/scrypted-simplirtc/issues"
    },
-   "homepage": "https://github.com/gilliginsisland/scrypted-simplisafe#readme",
+   "homepage": "https://github.com/gilliginsisland/scrypted-simplirtc#readme",
    "keywords": [
       "scrypted",
       "plugin",

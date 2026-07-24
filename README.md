@@ -20,25 +20,3 @@ can be implemented without introducing an RTSP proxy first.
 - Camera devices expose `MotionSensor` using SimpliSafe websocket
   `camera_motion_detected` events. SimpliSafe does not provide a matching clear
   event, so motion is held active for 30 seconds after each event.
-
-## Local Harness
-
-Generate a SimpliSafe login URL:
-
-```sh
-npm run harness:auth-url
-```
-
-After approving login, pass the final redirect URL back to the harness:
-
-```sh
-SIMPLISAFE_REDIRECT_URL='com.simplisafe.mobile://...' npm run harness:discovery
-```
-
-The harness stores tokens in `.simplisafe-auth.json`, which is ignored by git.
-
-Fetch live-view metadata for discovered supported cameras:
-
-```sh
-npm run harness:live-view
-```
