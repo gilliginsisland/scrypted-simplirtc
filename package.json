@@ -1,11 +1,10 @@
 {
    "name": "@gilliginsisland/scrypted-simplirtc",
-   "version": "0.0.2",
+   "version": "0.0.3",
    "description": "Native SimpliSafe camera plugin for Scrypted.",
    "type": "commonjs",
-   "main": "out/main.nodejs.js",
    "files": [
-      "out",
+      "dist/plugin.zip",
       "README.md",
       "LICENSE"
    ],
