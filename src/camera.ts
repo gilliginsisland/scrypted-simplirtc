@@ -49,29 +49,28 @@ export class SimpliSafeCameraDevice extends SimpliSafeDevice implements Camera, 
     }
 
     async primeSnapshot(): Promise<void> {
-        try {
-            for (const event of (await this.camera.events()).sort((left, right) =>
-                (right.eventTimestamp ?? 0) - (left.eventTimestamp ?? 0))) {
+        for await (const events of this.camera.events()) {
+            for (const event of events) {
                 if (event.eventCid !== CAMERA_MOTION_DETECTED_EVENT_CID
                     || !event.sensorSerial
                     || !this.eventSerials.includes(event.sensorSerial))
                     continue;
 
-                const snapshot = event.video && event.videoStartedBy
+                const media = event.video && event.videoStartedBy
                     ? event.video[event.videoStartedBy]?._links?.['snapshot/jpg']
                     : undefined;
-                if (!snapshot)
+                if (!media)
                     continue;
 
-                const timestamp = event.eventTimestamp;
-                this.cacheSnapshot(snapshot, timestamp === undefined
+                this.cacheSnapshot(media, event.eventTimestamp === undefined
                     ? undefined
-                    : new Date(timestamp > 1_000_000_000_000 ? timestamp : timestamp * 1000));
-                break;
+                    : new Date(event.eventTimestamp > 1_000_000_000_000
+                        ? event.eventTimestamp
+                        : event.eventTimestamp * 1000
+                    )
+                );
+                return
             }
-        }
-        catch (error) {
-            this.console.warn(`Failed to prime motion snapshot for SimpliSafe camera '${this.camera.name}'.`, error);
         }
     }
 

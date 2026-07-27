@@ -1,7 +1,7 @@
 import { z } from 'zod';
 import type { SimpliSafeApi, SimpliSafeMedia } from './api';
 
-const liveViewBaseUrl = 'https://app-hub.prd.aser.simplisafe.com/v2';
+const baseUrl = 'https://app-hub.prd.aser.simplisafe.com/v2';
 
 const cameraAdminSchema = z.looseObject({
     webRTCProvider: z.string().min(1),
@@ -85,29 +85,46 @@ export class SimpliSafeCamera {
     }
 
     async getLiveView<Backend extends SimpliSafeCameraBackend>(backend: Backend): Promise<SimpliSafeLiveView<Backend>> {
-        const liveViewSchema = Object.prototype.hasOwnProperty.call(liveViewParsers, backend)
+        const parser = Object.prototype.hasOwnProperty.call(liveViewParsers, backend)
             ? backend as SimpliSafeKnownCameraBackend
             : 'raw';
-        const liveViewParser = liveViewSchema === 'raw' ? raw : liveViewParsers[liveViewSchema];
-        const liveView = await this.api.requestJson(`cameras/${encodeURIComponent(this.uuid)}/${encodeURIComponent(this.systemId.toString())}/live-view`, {
-            baseUrl: liveViewBaseUrl,
-            schema: liveViewParser,
-        });
-        return {
-            ...liveView,
-            [schema]: liveViewSchema,
-        } as SimpliSafeLiveView<Backend>;
+        const schema = parser === 'raw' ? raw : liveViewParsers[parser];
+        const liveView = await this.api.requestJson(
+            `cameras/${encodeURIComponent(this.uuid)}/${encodeURIComponent(this.systemId.toString())}/live-view`,
+            { baseUrl, schema },
+        );
+        return liveView as SimpliSafeLiveView<Backend>;
     }
 
-    async events(): Promise<SimpliSafeEvent[]> {
-        const response = await this.api.requestJson(`subscriptions/${encodeURIComponent(this.systemId.toString())}/events?numEvents=50`, {
-            schema: z.looseObject({
-                events: z.array(simpliSafeEventSchema(this.api.mediaSchema())),
-            }),
-        });
+    private async getEvents(options?: { before?: number; pageSize?: number }): Promise<SimpliSafeEvent[]> {
+        const { before, pageSize } = options ?? {};
+        const searchParams = new URLSearchParams();
+        if (before !== undefined)
+            searchParams.set('fromTimestamp', before.toString());
+        if (pageSize !== undefined)
+            searchParams.set('numEvents', pageSize.toString());
+        const response = await this.api.requestJson(
+            `subscriptions/${encodeURIComponent(this.systemId.toString())}/events`,
+            {
+                schema: z.looseObject({
+                    events: z.array(simpliSafeEventSchema(this.api.mediaSchema())),
+                }),
+                searchParams,
+            },
+        );
         return response.events;
     }
 
+    async *events(options?: { before?: number; pageSize?: number }): AsyncIterable<SimpliSafeEvent[]> {
+        let before = options?.before;
+        for (; ;) {
+            const events = await this.getEvents({ ...options, before });
+            yield events;
+            if (events.length < (options?.pageSize ?? 1))
+                return;
+            before = events[events.length - 1].eventTimestamp! - 1;
+        }
+    }
 }
 
 const iceServerSchema = z.looseObject({
@@ -119,7 +136,6 @@ const iceServerSchema = z.looseObject({
     credential: z.string().min(1).optional(),
 });
 export const raw = z.looseObject({});
-export const schema = Symbol('schema');
 
 const liveViewParsers = {
     kvs: z.looseObject({
@@ -141,8 +157,6 @@ export type SimpliSafeCameraBackend = keyof typeof liveViewParsers | (string & {
 type SimpliSafeLiveViewParser<Backend extends string> = Backend extends SimpliSafeKnownCameraBackend
     ? (typeof liveViewParsers)[Backend]
     : typeof raw;
-type SimpliSafeLiveViewSchema<Backend extends string> = Backend extends SimpliSafeKnownCameraBackend ? Backend : 'raw';
-
 export type SimpliSafeLiveView<Backend extends string = SimpliSafeCameraBackend> = Backend extends string
-    ? z.output<SimpliSafeLiveViewParser<Backend>> & { [schema]: SimpliSafeLiveViewSchema<Backend> }
+    ? z.output<SimpliSafeLiveViewParser<Backend>>
     : never;

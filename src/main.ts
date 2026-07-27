@@ -195,7 +195,12 @@ export default class SimpliSafePlugin extends ScryptedDeviceBase implements Devi
                 throw new Error(`Unknown SimpliSafe camera nativeId=${nativeId}.`);
             const device = new SimpliSafeCameraDevice(this.api, this.realtimeEvents, nativeId, camera);
             this.devices.set(nativeId, device);
-            await device.primeSnapshot();
+            try {
+                await device.primeSnapshot();
+            }
+            catch (error) {
+                this.console.warn(`Failed to prime motion snapshot for SimpliSafe camera '${camera.name}'.`, error);
+            }
             await this.syncRealtimeWatchdog();
         }
         return this.devices.get(nativeId)!;

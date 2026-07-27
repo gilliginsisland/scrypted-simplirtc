@@ -70,6 +70,7 @@ const subscriptionsResponseSchema = z.looseObject({
 
 export interface SimpliSafeBinaryRequestOptions extends RequestInit {
     baseUrl?: string;
+    searchParams?: URLSearchParams;
 }
 
 export interface SimpliSafeRequestOptions<Schema extends z.ZodType> extends SimpliSafeBinaryRequestOptions {
@@ -93,14 +94,17 @@ export class SimpliSafeApi {
     }
 
     async requestBinary(path: string | URL, options: SimpliSafeBinaryRequestOptions = {}): Promise<Buffer> {
-        const { baseUrl = apiBaseUrl, ...init } = options;
+        const { baseUrl = apiBaseUrl, searchParams, ...init } = options;
         const accessToken = await this.auth.ensureAccessToken();
         const tokenType = this.auth.state.tokenType || 'Bearer';
         const headers = new Headers(init.headers);
         headers.set('Authorization', `${tokenType} ${accessToken}`);
         const method = init.method ?? 'GET';
+        const url = new URL(path, baseUrl.endsWith('/') ? baseUrl : `${baseUrl}/`);
+        if (searchParams)
+            url.search = searchParams.toString();
         const response = await fetch(
-            new URL(path, baseUrl.endsWith('/') ? baseUrl : `${baseUrl}/`),
+            url,
             { ...init, headers },
         );
         if (!response.ok) {
