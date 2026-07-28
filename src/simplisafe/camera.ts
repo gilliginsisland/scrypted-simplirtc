@@ -116,13 +116,16 @@ export class SimpliSafeCamera {
     }
 
     async *events(options?: { before?: number; pageSize?: number }): AsyncIterable<SimpliSafeEvent[]> {
-        let before = options?.before;
+        let opts = options;
         for (; ;) {
-            const events = await this.getEvents({ ...options, before });
+            const events = await this.getEvents(opts);
             yield events;
-            if (events.length < (options?.pageSize ?? 1))
+            if (events.length < (opts?.pageSize ?? 1))
                 return;
-            before = events[events.length - 1].eventTimestamp! - 1;
+            opts = {
+                before: events[events.length - 1].eventTimestamp!,
+                pageSize: events.length,
+            }
         }
     }
 }

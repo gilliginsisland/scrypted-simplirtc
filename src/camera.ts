@@ -49,7 +49,9 @@ export class SimpliSafeCameraDevice extends SimpliSafeDevice implements Camera, 
     }
 
     async primeSnapshot(): Promise<void> {
+        let pages = 0;
         for await (const events of this.camera.events()) {
+            pages++;
             for (const event of events) {
                 if (event.eventCid !== CAMERA_MOTION_DETECTED_EVENT_CID
                     || !event.sensorSerial
@@ -71,6 +73,8 @@ export class SimpliSafeCameraDevice extends SimpliSafeDevice implements Camera, 
                 );
                 return
             }
+            if (pages === 20)
+                break;
         }
     }
 
