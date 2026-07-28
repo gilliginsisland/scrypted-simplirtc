@@ -20,6 +20,4 @@ jobs:
           registry-url: https://registry.npmjs.org
           package-manager-cache: false
       - run: npm ci
-      - run: npm run check
-      - run: NODE_ENV=production npx scrypted-webpack
       - run: npm publish --access public

@@ -21,7 +21,7 @@ import {
 import { RTCAVSignalingSetup, RTCSessionControl, RTCSignalingSession } from '@scrypted/sdk';
 import type { Duplex } from 'stream';
 import { RTCIceCandidate, RTCPeerConnection } from 'werift';
-import WebSocket from 'ws';
+import WebSocket, { createWebSocketStream } from 'ws';
 import { gzipSync } from 'zlib';
 import { createCandidateQueue, Deferred } from './common';
 
@@ -75,7 +75,7 @@ export class LiveKitSignaling implements AsyncIterable<LiveKitSignalMessage> {
     }
 
     constructor(ws: WebSocket) {
-        this.messageStream = WebSocket.createWebSocketStream(ws, { readableObjectMode: true });
+        this.messageStream = createWebSocketStream(ws, { readableObjectMode: true });
         this.messageStream.on('end', () => void this.close());
         this.messageStream.on('error', () => void this.close());
     }
