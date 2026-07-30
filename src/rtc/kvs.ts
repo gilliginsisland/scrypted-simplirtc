@@ -14,75 +14,76 @@ import { createCandidateQueue, Deferred } from './common';
 
 const maxKVSMessagePayloadSize = 10 * 1024;
 
-const kvsStatusResponseSchema = z.looseObject({
-    correlationId: z.string(),
-    errorType: z.string().optional(),
-    statusCode: z.string().optional(),
-    description: z.string().optional(),
-});
-const kvsStatusResponseEnvelopeSchema = z.looseObject({
-    messageType: z.literal('STATUS_RESPONSE'),
-    messagePayload: z.string().optional(),
-    statusResponse: kvsStatusResponseSchema,
-});
+const kvsEncodedMessagePayloadSchema = z.string().transform(value =>
+    JSON.parse(Buffer.from(value, 'base64').toString('utf8'))
+);
 const kvsMessageEnvelopeSchema = z.union([
-    kvsStatusResponseEnvelopeSchema,
-    z.looseObject({
-        messageType: z.string().refine(messageType => messageType !== 'STATUS_RESPONSE'),
-        messagePayload: z.string(),
-        statusResponse: z.never().optional(),
-    }),
+    z.discriminatedUnion('messageType', [
+        z.looseObject({
+            messageType: z.literal('STATUS_RESPONSE'),
+            messagePayload: z.string().optional(),
+            statusResponse: z.looseObject({
+                correlationId: z.string(),
+                errorType: z.string().optional(),
+                statusCode: z.string().optional(),
+                description: z.string().optional(),
+            }),
+        }),
+        z.looseObject({
+            messageType: z.literal('SDP_OFFER'),
+            messagePayload: kvsEncodedMessagePayloadSchema.pipe(z.looseObject({
+                type: z.literal('offer'),
+                sdp: z.string().min(1),
+            })),
+        }),
+        z.looseObject({
+            messageType: z.literal('SDP_ANSWER'),
+            messagePayload: kvsEncodedMessagePayloadSchema.pipe(z.looseObject({
+                type: z.string().optional(),
+                sdp: z.string().min(1),
+            })),
+        }),
+        z.looseObject({
+            messageType: z.literal('ICE_CANDIDATE'),
+            messagePayload: kvsEncodedMessagePayloadSchema.pipe(z.looseObject({
+                candidate: z.string().optional().default(''),
+                sdpMid: z.string().nullable().optional(),
+                sdpMLineIndex: z.number().int().nullable().optional(),
+                usernameFragment: z.string().nullable().optional(),
+            })),
+        }),
+    ]),
+    z.unknown().transform(raw => ({ messageType: 'raw' as const, raw })),
 ]);
-export const raw = z.unknown();
-export const schema = Symbol('schema');
+const kvsResponseSchema = z.string()
+    .transform(data => JSON.parse(data))
+    .pipe(kvsMessageEnvelopeSchema);
 
-const kvsMessagePayloadSchemas = {
-    SDP_OFFER: z.looseObject({
-        type: z.literal('offer'),
-        sdp: z.string().min(1),
-    }),
-    SDP_ANSWER: z.looseObject({
-        type: z.string().optional(),
-        sdp: z.string().min(1),
-    }),
-    ICE_CANDIDATE: z.looseObject({
-        candidate: z.string().optional().default(''),
-        sdpMid: z.string().nullable().optional(),
-        sdpMLineIndex: z.number().int().nullable().optional(),
-        usernameFragment: z.string().nullable().optional(),
-    }),
-} as const satisfies Readonly<Record<string, z.ZodType>>;
+type KVSMessage = Exclude<
+    KVSResponse,
+    { messageType: 'STATUS_RESPONSE' }
+>;
+type KVSRequestMessage = Exclude<KVSMessage, { messageType: 'raw' }>;
+export type KVSMessageType = KVSRequestMessage['messageType'];
+type KVSMessagePayload<Type extends KVSMessageType> = Extract<
+    KVSRequestMessage,
+    { messageType: Type }
+>['messagePayload'];
 
-export type KVSMessageType = keyof typeof kvsMessagePayloadSchemas;
-type KVSMessageParser<Type extends string> = Type extends KVSMessageType
-    ? (typeof kvsMessagePayloadSchemas)[Type]
-    : typeof raw;
-type KVSMessageSchema<Type extends string> = Type extends KVSMessageType ? Type : 'raw';
-type KVSMessagePayload<Type extends string> = z.output<KVSMessageParser<Type>>;
-
-export type KVSMessage<Type extends string = KVSMessageType> = Type extends string
-    ? {
-        messageType: Type;
-        messagePayload: KVSMessagePayload<Type>;
-        [schema]: KVSMessageSchema<Type>;
-    }
-    : never;
-
-export interface KVSRequest<Type extends string = KVSMessageType> {
+export interface KVSRequest<Type extends KVSMessageType = KVSMessageType> {
     action: Type;
     recipientClientId: string;
     correlationId: string;
     messagePayload: KVSMessagePayload<Type>;
 }
 
-type KVSStatusResponse = z.output<typeof kvsStatusResponseEnvelopeSchema> & { [schema]: 'STATUS_RESPONSE' };
-export type KVSResponse = KVSMessage<KVSMessageType> | KVSMessage<string> | KVSStatusResponse;
+export type KVSResponse = z.output<typeof kvsResponseSchema>;
 
 function serializeKVSMessagePayload(messagePayload: unknown): string {
     return Buffer.from(JSON.stringify(messagePayload)).toString('base64');
 }
 
-export function serializeKVSRequest<Type extends string>(request: KVSRequest<Type>): string {
+export function serializeKVSRequest<Type extends KVSMessageType>(request: KVSRequest<Type>): string {
     const messagePayload = serializeKVSMessagePayload(request.messagePayload);
     if (Buffer.byteLength(messagePayload) > maxKVSMessagePayloadSize)
         throw new Error(`KVS ${request.action} message payload exceeds the 10 KiB limit.`);
@@ -94,27 +95,7 @@ export function serializeKVSRequest<Type extends string>(request: KVSRequest<Typ
 }
 
 export function unserializeKVSResponse(data: string): KVSResponse {
-    const parsed = kvsMessageEnvelopeSchema.parse(JSON.parse(data));
-    if (parsed.messageType === 'STATUS_RESPONSE') {
-        return {
-            ...parsed,
-            [schema]: parsed.messageType,
-        } as KVSStatusResponse;
-    }
-
-    const messageSchema = Object.prototype.hasOwnProperty.call(kvsMessagePayloadSchemas, parsed.messageType)
-        ? parsed.messageType as KVSMessageType
-        : 'raw';
-    if (!parsed.messagePayload)
-        throw new Error(`KVS ${parsed.messageType} message is missing messagePayload.`);
-
-    const payload = JSON.parse(Buffer.from(parsed.messagePayload, 'base64').toString('utf8'));
-    const messageParser = messageSchema === 'raw' ? raw : kvsMessagePayloadSchemas[messageSchema];
-    return {
-        ...parsed,
-        messagePayload: messageParser.parse(payload),
-        [schema]: messageSchema,
-    } as KVSResponse;
+    return kvsResponseSchema.parse(data);
 }
 
 const kvsCodecRemovalOrder = ['AV1', 'telephone-event', 'CN', 'G722', 'PCMU', 'PCMA'] as const;
@@ -282,10 +263,10 @@ export class KVSRTCSignalingSession implements RTCSignalingSession, RTCSessionCo
                 console.error('Failed to parse KVS signaling message.', error);
                 continue;
             }
-            if (message[schema] === 'raw')
-                continue;
-
             switch (message.messageType) {
+                case 'raw':
+                    console.debug('Received unhandled KVS signaling message.', message.raw);
+                    break;
                 case 'SDP_ANSWER': {
                     this.answer?.resolve({
                         type: 'answer',

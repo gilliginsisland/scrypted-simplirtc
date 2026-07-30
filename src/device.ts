@@ -1,37 +1,27 @@
 import { ScryptedDeviceBase } from '@scrypted/sdk';
 import type {
-    SimpliSafeApi,
-    SimpliSafeRealtimeEvent,
-    SimpliSafeRealtimeEventMap,
-    SimpliSafeRealtimeEvents,
+    SimpliSafeCamera,
+    SimpliSafeEvent,
+    SimpliSafeEventType,
 } from './simplisafe';
 
+type SimpliSafeEventHandler = (this: SimpliSafeDevice, event: SimpliSafeEvent) => void;
+type SimpliSafeEventHandlers = ReadonlyMap<SimpliSafeEventType, SimpliSafeEventHandler>;
 export abstract class SimpliSafeDevice extends ScryptedDeviceBase {
-    private realtimeListenerRemovers: (() => void)[] = [];
-    protected abstract eventSerials: readonly string[];
+    protected static readonly eventHandlers: SimpliSafeEventHandlers = new Map();
 
-    constructor(public api: SimpliSafeApi, public realtimeEvents: SimpliSafeRealtimeEvents, nativeId?: string) {
+    constructor(private readonly device: SimpliSafeCamera, nativeId?: string) {
         super(nativeId);
-    }
-
-    protected addRealtimeListener<EventName extends keyof SimpliSafeRealtimeEventMap & string>(
-        eventName: EventName,
-        listener: (...args: SimpliSafeRealtimeEventMap[EventName]) => void,
-    ): void {
-        const filteredListener = (...args: SimpliSafeRealtimeEventMap[EventName]) => {
-            const event = args[0] as SimpliSafeRealtimeEvent | undefined;
-            if (!event?.sensorSerial || !this.eventSerials.includes(event.sensorSerial))
-                return;
-            listener(...args);
-        };
-        this.realtimeEvents.on(eventName, filteredListener as never);
-        this.realtimeListenerRemovers.push(() => {
-            this.realtimeEvents.off(eventName, filteredListener as never)
-        });
+        const handlers = (this.constructor as typeof SimpliSafeDevice).eventHandlers;
+        for (const [eventType, handler] of handlers) {
+            const listener = (event: SimpliSafeEvent) => handler.call(this, event);
+            this.device.subscription.api.events.addEventListener(eventType, this.device, listener);
+        }
     }
 
     release(): void {
-        for (const removeListener of this.realtimeListenerRemovers.splice(0))
-            removeListener();
+        for (const eventType of (this.constructor as typeof SimpliSafeDevice).eventHandlers.keys()) {
+            this.device.subscription.api.events.removeEventListener(eventType, this.device);
+        }
     }
 }

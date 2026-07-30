@@ -1,11 +1,12 @@
-export { SimpliSafeApi, SimpliSafeMedia, TemplateUrl } from './api';
+export { SimpliSafeApi } from './api';
+export { TemplateUrl } from './media';
+export type { SimpliSafeMedia } from './media';
 export { SimpliSafeCamera } from './camera';
 export { SimpliSafeAuth } from './oauth';
 export {
-    CAMERA_MOTION_DETECTED_EVENT_CID,
+    SimpliSafeEventType,
     SimpliSafeRealtimeEvents,
-    SimpliSafeRealtimeWatchdog,
 } from './realtime';
 export { SimpliSafeSubscription } from './subscription';
 export type { SimpliSafeTokenState, SimpliSafeTokenStore } from './oauth';
-export type { SimpliSafeRealtimeEvent, SimpliSafeRealtimeEventMap } from './realtime';
+export type { SimpliSafeEvent, SimpliSafeRealtimeOptions } from './realtime';

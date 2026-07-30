@@ -1,65 +1,9 @@
 import { z } from 'zod';
 import { SimpliSafeAuth } from './oauth';
+import { SimpliSafeRealtimeEvents } from './realtime';
 import { SimpliSafeSubscription, subscriptionSummarySchema } from './subscription';
 
 const apiBaseUrl = 'https://api.simplisafe.com/v1';
-
-export class TemplateUrl {
-    readonly #url: URL;
-    readonly #keys: readonly string[];
-
-    constructor(private readonly template: string) {
-        const match = /\{[?&]([^}]*)\}$/.exec(template);
-        this.#url = new URL(match ? template.slice(0, match.index) : template);
-        this.#keys = match?.[1].split(',') ?? [];
-    }
-
-    keys(): string[] {
-        return [...this.#keys];
-    }
-
-    render(values: Readonly<Record<string, string | number | boolean | undefined>> = {}): URL {
-        const url = new URL(this.#url);
-        for (const [key, value] of Object.entries(values)) {
-            if (value !== undefined)
-                url.searchParams.set(key, value.toString());
-        }
-        return url;
-    }
-
-    toString(): string {
-        return this.template;
-    }
-}
-
-const templateUrlSchema = z.string().url().transform(value => new TemplateUrl(value));
-
-export interface SimpliSafeMediaSize {
-    width?: number;
-    height?: number;
-}
-
-export class SimpliSafeMedia {
-    constructor(private api: SimpliSafeApi, readonly url: TemplateUrl) {
-    }
-
-    async fetch(size: SimpliSafeMediaSize = {}): Promise<Buffer> {
-        return this.api.requestBinary(this.url.render({
-            width: size.width,
-            height: size.height,
-        }), {
-            headers: {
-                Accept: 'image/jpeg',
-            },
-        });
-    }
-}
-
-export function simpliSafeMediaSchema(api: SimpliSafeApi) {
-    return z.looseObject({
-        href: templateUrlSchema,
-    }).transform(media => new SimpliSafeMedia(api, media.href));
-}
 
 const authCheckSchema = z.looseObject({
     userId: z.number(),
@@ -78,11 +22,11 @@ export interface SimpliSafeRequestOptions<Schema extends z.ZodType> extends Simp
 }
 
 export class SimpliSafeApi {
-    private auth: SimpliSafeAuth;
     #subscriptions = new Map<number, SimpliSafeSubscription>();
+    readonly events: SimpliSafeRealtimeEvents;
 
-    constructor(auth: SimpliSafeAuth) {
-        this.auth = auth;
+    constructor(public readonly auth: SimpliSafeAuth, readonly console: Console) {
+        this.events = new SimpliSafeRealtimeEvents(this);
     }
 
     async requestJson<Schema extends z.ZodType>(path: string | URL, options: SimpliSafeRequestOptions<Schema>): Promise<z.output<Schema>> {
@@ -110,20 +54,19 @@ export class SimpliSafeApi {
         if (!response.ok) {
             const text = await response.text();
             const requestPath = typeof path === 'string' ? path : path.pathname;
-            throw new Error(`SimpliSafe API request failed: ${method} ${requestPath}: ${response.status} ${response.statusText}: ${text}`);
+            throw new Error(
+                `SimpliSafe API request failed: ${method} ${requestPath}: ${response.status} ${response.statusText}: ${text}`
+            );
         }
         return Buffer.from(await response.arrayBuffer());
     }
 
-    mediaSchema() {
-        return simpliSafeMediaSchema(this);
-    }
-
     async update(): Promise<void> {
         const userId = await this.getUserId();
-        const response = await this.requestJson(`users/${encodeURIComponent(userId.toString())}/subscriptions?activeOnly=false`, {
-            schema: subscriptionsResponseSchema,
-        });
+        const response = await this.requestJson(
+            `users/${encodeURIComponent(userId.toString())}/subscriptions?activeOnly=false`,
+            { schema: subscriptionsResponseSchema },
+        );
         const subscriptionIds = new Set<number>();
 
         for (const subscription of response.subscriptions) {
@@ -137,8 +80,10 @@ export class SimpliSafeApi {
                 this.#subscriptions.delete(subscriptionId);
         }
 
-        for (const subscription of this.#subscriptions.values())
-            await subscription.update();
+        await Promise.all(Array.from(
+            this.#subscriptions.values(),
+            subscription => subscription.update(),
+        ));
     }
 
     subscriptions(): Iterable<SimpliSafeSubscription> {

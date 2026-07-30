@@ -1,24 +1,57 @@
-import { EventEmitter } from 'events';
-import WebSocket, { RawData } from 'ws';
+import WebSocket, { createWebSocketStream, RawData } from 'ws';
 import { z } from 'zod';
-import type { SimpliSafeApi, SimpliSafeMedia } from './api';
-import { simpliSafeEventSchema } from './camera';
-import type { SimpliSafeEvent } from './camera';
+import type { SimpliSafeApi } from './api';
+import type { SimpliSafeCamera } from './camera';
+import { simpliSafeMediaSchema } from './media';
 
 export const simplisafeRealtimeWebsocketUrl = 'wss://socketlink.prd.aser.simplisafe.com';
 const websocketSource = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/15.0 Safari/605.1.15';
-const defaultRealtimePingIntervalMs = 55_000;
-const defaultRealtimeReconnectDelayMs = 5_000;
-const defaultRealtimeWatchdogTimeoutMs = 5 * 60_000;
-export const CAMERA_MOTION_DETECTED_EVENT_CID = 1170;
-const eventTypeByCid = new Map<number, string>([
-    [CAMERA_MOTION_DETECTED_EVENT_CID, 'camera_motion_detected'],
-]);
+export const SimpliSafeEventType = {
+    CameraMotionDetected: 1170,
+    VideoRecording: Symbol('VideoRecording'),
+} as const;
+export type SimpliSafeEventType = (typeof SimpliSafeEventType)[keyof typeof SimpliSafeEventType];
 
 export interface SimpliSafeRealtimeIdentify {
     accessToken: string;
     userId: number;
 }
+
+const eventVideoSchema = z.looseObject({
+    _links: z.looseObject({
+        'snapshot/jpg': simpliSafeMediaSchema.optional(),
+    }).optional(),
+});
+export const simpliSafeEventSchema = z.looseObject({
+    eventCid: z.number(),
+    eventTimestamp: z.number(),
+    info: z.string().min(1),
+    sid: z.number(),
+    sensorName: z.string(),
+    sensorSerial: z.string(),
+    sensorType: z.union([
+        z.string().min(1),
+        z.number(),
+    ]).optional(),
+    video: z.record(z.string(), eventVideoSchema).nullable().optional(),
+});
+export type SimpliSafeEvent = z.output<typeof simpliSafeEventSchema>;
+
+const realtimeMessageSchema = z.union([
+    z.discriminatedUnion('type', [
+        z.looseObject({
+            type: z.literal('com.simplisafe.event.standard'),
+            data: simpliSafeEventSchema,
+        }),
+        z.looseObject({
+            type: z.literal('socketlink'),
+        }),
+        z.looseObject({
+            type: z.literal('com.simplisafe.event.camera'),
+        }),
+    ]),
+    z.unknown().transform(raw => ({ type: 'raw' as const, raw })),
+]);
 
 interface SimpliSafeRealtimeIdentifyMessage {
     datacontenttype: 'application/json';
@@ -36,206 +69,155 @@ interface SimpliSafeRealtimeIdentifyMessage {
     };
 }
 
-export type SimpliSafeRealtimeEvent = SimpliSafeEvent & {
-    eventType?: string;
-    systemId?: number;
-    timestamp?: Date;
-    snapshot?: SimpliSafeMedia;
-    raw: unknown;
-};
+type SimpliSafeRealtimeEventListener = (event: SimpliSafeEvent) => void;
 
-export interface SimpliSafeRealtimeEventMap {
-    realtimeEvent: [SimpliSafeRealtimeEvent];
-    camera_motion_detected: [SimpliSafeRealtimeEvent];
+enum SimpliSafeRealtimeState {
+    Disconnected,
+    Connecting,
+    Connected,
 }
 
-export class SimpliSafeRealtimeEvents extends EventEmitter<SimpliSafeRealtimeEventMap> {
-    private readonly eventSchema: ReturnType<typeof simpliSafeEventSchema>;
-
-    constructor(api: SimpliSafeApi) {
-        super();
-        this.eventSchema = simpliSafeEventSchema(api.mediaSchema());
-    }
-
-    hasListeners(): boolean {
-        return this.eventNames().some(eventName => this.listenerCount(eventName) > 0);
-    }
-
-    onMessage(data: RawData): void {
-        this.handleMessage(data);
-    }
-
-    private handleMessage(data: RawData): void {
-        let payload: unknown;
-        try {
-            payload = JSON.parse(rawDataToString(data));
-        }
-        catch {
-            return;
-        }
-
-        const event = this.parseRealtimeEvent(payload);
-        if (!event)
-            return;
-
-        this.emit('realtimeEvent', event);
-        if (event.eventType === 'camera_motion_detected')
-            this.emit('camera_motion_detected', event);
-    }
-
-    private parseRealtimeEvent(payload: unknown): SimpliSafeRealtimeEvent | undefined {
-        const parsed = z.looseObject({
-            type: z.literal('com.simplisafe.event.standard'),
-            data: this.eventSchema,
-        }).safeParse(payload);
-        if (parsed.success)
-            return this.createRealtimeEvent(parsed.data.data, payload);
-
-        return this.parseRealtimeEventData(payload);
-    }
-
-    private parseRealtimeEventData(data: unknown, raw = data): SimpliSafeRealtimeEvent | undefined {
-        const parsed = this.eventSchema.safeParse(data);
-        if (!parsed.success)
-            return;
-
-        return this.createRealtimeEvent(parsed.data, raw);
-    }
-
-    private createRealtimeEvent(event: SimpliSafeEvent, raw: unknown): SimpliSafeRealtimeEvent {
-        const eventCid = event.eventCid;
-        const timestamp = dateFromEpoch(event.eventTimestamp);
-        return {
-            ...event,
-            eventType: eventCid === undefined ? undefined : eventTypeByCid.get(eventCid),
-            systemId: event.sid,
-            timestamp,
-            snapshot: event.video && event.videoStartedBy
-                ? event.video[event.videoStartedBy]?._links?.['snapshot/jpg']
-                : undefined,
-            raw,
-        };
-    }
-}
-
-export interface SimpliSafeRealtimeWatchdogOptions {
+export interface SimpliSafeRealtimeOptions {
     pingIntervalMs?: number;
     reconnectDelayMs?: number;
-    watchdogTimeoutMs?: number;
+    reconnectTimeoutMs?: number;
     websocketUrl?: string;
 }
 
-export class SimpliSafeRealtimeWatchdog {
+export class SimpliSafeRealtimeEvents {
+    private listeners = new Map<
+        SimpliSafeEventType,
+        Map<string, SimpliSafeRealtimeEventListener>
+    >();
     private ws?: WebSocket;
-    private removeWebSocketListeners?: () => void;
-    private pingTimer?: NodeJS.Timeout;
-    private reconnectTimer?: NodeJS.Timeout;
-    private watchdogTimer?: NodeJS.Timeout;
     private readonly pingIntervalMs: number;
     private readonly reconnectDelayMs: number;
-    private readonly watchdogTimeoutMs: number;
+    private readonly reconnectTimeoutMs: number;
     private readonly websocketUrl: string;
-    private connecting = false;
-    private started = false;
+    private state = SimpliSafeRealtimeState.Disconnected;
 
     constructor(
-        private realtimeEvents: SimpliSafeRealtimeEvents,
-        private getIdentify: () => Promise<SimpliSafeRealtimeIdentify>,
-        options: SimpliSafeRealtimeWatchdogOptions = {},
+        private api: SimpliSafeApi,
+        {
+            pingIntervalMs = 55_000,
+            reconnectDelayMs = 5_000,
+            reconnectTimeoutMs = 5 * 60_000,
+            websocketUrl = simplisafeRealtimeWebsocketUrl,
+        }: SimpliSafeRealtimeOptions = {},
     ) {
-        this.pingIntervalMs = options.pingIntervalMs ?? defaultRealtimePingIntervalMs;
-        this.reconnectDelayMs = options.reconnectDelayMs ?? defaultRealtimeReconnectDelayMs;
-        this.watchdogTimeoutMs = options.watchdogTimeoutMs ?? defaultRealtimeWatchdogTimeoutMs;
-        this.websocketUrl = options.websocketUrl ?? simplisafeRealtimeWebsocketUrl;
+        this.pingIntervalMs = pingIntervalMs;
+        this.reconnectDelayMs = reconnectDelayMs;
+        this.reconnectTimeoutMs = reconnectTimeoutMs;
+        this.websocketUrl = websocketUrl;
     }
 
-    async start(): Promise<void> {
-        this.started = true;
-        await this.connect();
+    addEventListener(eventType: SimpliSafeEventType, camera: SimpliSafeCamera, listener: SimpliSafeRealtimeEventListener): void {
+        let listeners = this.listeners.get(eventType);
+        if (!listeners) {
+            listeners = new Map();
+            this.listeners.set(eventType, listeners);
+        }
+        let deviceId: string;
+        switch (eventType) {
+            case SimpliSafeEventType.VideoRecording:
+                deviceId = camera.uuid;
+                break;
+            default:
+                deviceId = camera.serial;
+                break;
+        }
+        listeners.set(deviceId, listener);
+        void this.sync();
     }
 
-    stop(): void {
-        this.started = false;
-        this.clearReconnect();
-        this.closeWebSocket();
-    }
-
-    private async connect(): Promise<void> {
-        if (!this.started || this.connecting)
+    removeEventListener(eventType: SimpliSafeEventType, camera: SimpliSafeCamera): void {
+        const listeners = this.listeners.get(eventType);
+        if (!listeners)
             return;
-        if (this.ws && this.ws.readyState !== WebSocket.CLOSED && this.ws.readyState !== WebSocket.CLOSING)
-            return;
-
-        this.connecting = true;
-        try {
-            const identify = await this.getIdentify();
-            if (!this.started)
-                return;
-            this.replaceWebSocket(new WebSocket(this.websocketUrl), identify);
+        let deviceId: string;
+        switch (eventType) {
+            case SimpliSafeEventType.VideoRecording:
+                deviceId = camera.uuid;
+                break;
+            default:
+                deviceId = camera.serial;
+                break;
         }
-        catch {
-            this.scheduleReconnect();
-        }
-        finally {
-            this.connecting = false;
-        }
+        listeners.delete(deviceId);
+        if (!listeners.size)
+            this.listeners.delete(eventType);
+        void this.sync();
     }
 
-    private replaceWebSocket(ws: WebSocket, identify: SimpliSafeRealtimeIdentify): void {
-        this.closeWebSocket();
-        this.ws = ws;
+    private sync(): void {
+        if (!this.listeners.size)
+            this.ws?.close();
+        else
+            this.loop();
+    }
 
-        const onOpen = () => {
-            if (this.ws !== ws)
-                return;
-            this.startPing(ws);
+    private async loop(): Promise<void> {
+        while (this.listeners.size && this.state === SimpliSafeRealtimeState.Disconnected) {
+            this.state = SimpliSafeRealtimeState.Connecting;
             try {
-                this.sendIdentify(ws, identify);
-                this.triggerWatchdog(ws);
+                const ws = this.ws = new WebSocket(this.websocketUrl);
+                const stream = createWebSocketStream(ws, { decodeStrings: false });
+                const identify = JSON.stringify(await this.getIdentifyMessage());
+                await new Promise<void>((resolve, reject) => {
+                    stream.write(identify, error => error && reject(error) || resolve());
+                });
+                void this.heartbeat(ws);
+                this.state = SimpliSafeRealtimeState.Connected;
+                for await (const data of stream) {
+                    try {
+                        this.onMessage(data as RawData);
+                    } catch (error) {
+                        this.api.console.error('Failed to parse SimpliSafe realtime message.', error);
+                    }
+                }
+            } catch (error) {
+                this.api.console.error('SimpliSafe realtime connection failed.', error);
+            } finally {
+                this.ws = undefined;
+                this.state = SimpliSafeRealtimeState.Disconnected;
             }
-            catch {
-                ws.close();
-                this.scheduleReconnect();
-            }
-        };
-        const onMessage = (data: RawData) => {
-            if (this.ws !== ws)
-                return;
-            this.triggerWatchdog(ws);
-            this.realtimeEvents.onMessage(data);
-        };
-        const onClose = () => {
-            if (this.ws !== ws)
-                return;
-
-            this.cleanupWebSocket();
-            this.scheduleReconnect();
-        };
-        const onError = () => {
-            if (this.ws !== ws)
-                return;
-            ws.close();
-            this.scheduleReconnect();
-        };
-
-        ws.on('open', onOpen);
-        ws.on('message', onMessage);
-        ws.on('close', onClose);
-        ws.on('error', onError);
-        this.removeWebSocketListeners = () => {
-            ws.off('open', onOpen);
-            ws.off('message', onMessage);
-            ws.off('close', onClose);
-            ws.off('error', onError);
-        };
+            await sleep(this.reconnectDelayMs);
+        }
     }
 
-    private sendIdentify(ws: WebSocket, identify: SimpliSafeRealtimeIdentify): void {
-        if (ws.readyState !== WebSocket.OPEN)
-            throw new Error('SimpliSafe realtime websocket is not open.');
+    private onMessage(data: RawData): void {
+        if (Array.isArray(data))
+            data = Buffer.concat(data);
+        else if (!Buffer.isBuffer(data))
+            data = Buffer.from(data);
+        const payload = JSON.parse(data.toString('utf8')) as unknown;
+        const message = realtimeMessageSchema.parse(payload);
+        switch (message.type) {
+            case 'com.simplisafe.event.standard': {
+                const event = message.data;
+                this.listeners
+                    .get(event.eventCid as SimpliSafeEventType)
+                    ?.get(event.sensorSerial)
+                    ?.(event);
+                for (const cameraUuid of Object.keys(event.video ?? {}))
+                    this.listeners
+                        .get(SimpliSafeEventType.VideoRecording)
+                        ?.get(cameraUuid)
+                        ?.(event);
+                break;
+            }
+            case 'socketlink':
+            case 'com.simplisafe.event.camera':
+                break;
+            case 'raw':
+                this.api.console.debug('Received unhandled SimpliSafe realtime message.', message.raw);
+                break;
+        }
+    }
 
+    private async getIdentifyMessage(): Promise<SimpliSafeRealtimeIdentifyMessage> {
         const now = new Date();
-        const message: SimpliSafeRealtimeIdentifyMessage = {
+        return {
             datacontenttype: 'application/json',
             type: 'com.simplisafe.connection.identify',
             time: now.toISOString(),
@@ -245,92 +227,44 @@ export class SimpliSafeRealtimeWatchdog {
             data: {
                 auth: {
                     schema: 'bearer',
-                    token: identify.accessToken,
+                    token: await this.api.auth.ensureAccessToken(),
                 },
-                join: [`uid:${identify.userId}`],
+                join: [`uid:${await this.api.getUserId()}`],
             },
         };
-        ws.send(JSON.stringify(message));
     }
 
-    private closeWebSocket(): void {
-        const ws = this.ws;
-        this.cleanupWebSocket();
-        ws?.close();
-    }
+    private async heartbeat(ws: WebSocket): Promise<void> {
+        let missedPing = false;
+        let nextMessageTimeout = 0;
 
-    private cleanupWebSocket(): void {
-        this.removeWebSocketListeners?.();
-        this.removeWebSocketListeners = undefined;
-        this.clearPing();
-        this.clearWatchdog();
-        this.ws = undefined;
-    }
+        const onMessage = () => { nextMessageTimeout = Date.now() + this.reconnectTimeoutMs }
+        onMessage();
 
-    private startPing(ws: WebSocket): void {
-        this.clearPing();
-        this.pingTimer = setInterval(() => {
-            if (this.ws === ws && ws.readyState === WebSocket.OPEN)
-                ws.ping();
-        }, this.pingIntervalMs);
-    }
+        ws.on('message', onMessage);
+        ws.on('pong', () => { missedPing = false });
 
-    private clearPing(): void {
-        if (!this.pingTimer)
-            return;
-        clearInterval(this.pingTimer);
-        this.pingTimer = undefined;
-    }
-
-    private triggerWatchdog(ws: WebSocket): void {
-        this.clearWatchdog();
-        this.watchdogTimer = setTimeout(() => {
-            this.watchdogTimer = undefined;
-            if (this.ws !== ws)
+        for (; ;) {
+            await sleep(Math.min(
+                this.pingIntervalMs,
+                Math.max(0, nextMessageTimeout - Date.now()),
+            ));
+            switch (ws.readyState) {
+                case WebSocket.CONNECTING:
+                    continue;
+                case WebSocket.OPEN:
+                    break;
+                default:
+                    return;
+            }
+            if (missedPing || Date.now() >= nextMessageTimeout) {
+                ws.close();
                 return;
-            ws.close();
-            this.scheduleReconnect();
-        }, this.watchdogTimeoutMs);
-    }
-
-    private clearWatchdog(): void {
-        if (!this.watchdogTimer)
-            return;
-        clearTimeout(this.watchdogTimer);
-        this.watchdogTimer = undefined;
-    }
-
-    private scheduleReconnect(): void {
-        if (!this.started || this.reconnectTimer)
-            return;
-        this.reconnectTimer = setTimeout(() => {
-            this.reconnectTimer = undefined;
-            this.connect().catch(() => {
-                this.scheduleReconnect();
-            });
-        }, this.reconnectDelayMs);
-    }
-
-    private clearReconnect(): void {
-        if (!this.reconnectTimer)
-            return;
-        clearTimeout(this.reconnectTimer);
-        this.reconnectTimer = undefined;
+            }
+            missedPing = true;
+            ws.ping();
+        }
     }
 }
 
-function rawDataToString(data: RawData): string {
-    if (typeof data === 'string')
-        return data;
-    if (Buffer.isBuffer(data))
-        return data.toString('utf8');
-    if (Array.isArray(data))
-        return Buffer.concat(data).toString('utf8');
-    return Buffer.from(data).toString('utf8');
-}
-
-function dateFromEpoch(value: number | undefined): Date | undefined {
-    if (value === undefined)
-        return;
-    return new Date(value > 1_000_000_000_000 ? value : value * 1000);
-}
+const sleep = (ms: number) => new Promise<void>(resolve => setTimeout(resolve, ms));

@@ -13,94 +13,64 @@ import { connectRTCSignalingClients } from './rtc/common';
 import { KVSRTCSignalingSession } from './rtc/kvs';
 import { LiveKitSession } from './rtc/livekit';
 import {
-    CAMERA_MOTION_DETECTED_EVENT_CID,
-    type SimpliSafeApi,
+    SimpliSafeEventType,
+    TemplateUrl,
     type SimpliSafeCamera,
-    type SimpliSafeMedia,
-    type SimpliSafeRealtimeEvent,
-    type SimpliSafeRealtimeEvents,
+    type SimpliSafeEvent,
 } from './simplisafe';
 
 const motionHoldMs = 30_000;
 
 export class SimpliSafeCameraDevice extends SimpliSafeDevice implements Camera, RTCSignalingChannel, MotionSensor {
     private motionResetTimer?: NodeJS.Timeout;
-    private snapshot?: SimpliSafeMedia;
-    private snapshotEventTime = 0;
 
-    protected get eventSerials(): readonly string[] {
-        return [this.camera.uuid, this.camera.serial];
-    }
+    protected static override readonly eventHandlers = new Map<SimpliSafeEventType, (event: SimpliSafeEvent) => void>([
+        [SimpliSafeEventType.CameraMotionDetected, SimpliSafeCameraDevice.prototype.onMotion],
+        [SimpliSafeEventType.VideoRecording, SimpliSafeCameraDevice.prototype.onVideo],
+    ]);
 
-    constructor(api: SimpliSafeApi, realtimeEvents: SimpliSafeRealtimeEvents, nativeId: string, public camera: SimpliSafeCamera) {
-        super(api, realtimeEvents, nativeId);
+    constructor(nativeId: string, public camera: SimpliSafeCamera) {
+        super(camera, nativeId);
         this.motionDetected = false;
-        this.addRealtimeListener('camera_motion_detected', event => this.onMotion(event));
     }
 
-    private onMotion(event: SimpliSafeRealtimeEvent): void {
-        const eventTime = event.timestamp ? ` at ${event.timestamp.toISOString()}` : '';
-        this.console.log(`Motion detected by SimpliSafe camera '${this.camera.name}'${eventTime}.`);
-
+    private onMotion(): void {
         this.clearMotion();
         this.motionDetected = true;
         this.motionResetTimer = setTimeout(() => this.clearMotion(), motionHoldMs);
-        this.cacheSnapshot(event.snapshot, event.timestamp);
     }
 
-    async primeSnapshot(): Promise<void> {
-        let pages = 0;
-        for await (const events of this.camera.events()) {
-            pages++;
-            for (const event of events) {
-                if (event.eventCid !== CAMERA_MOTION_DETECTED_EVENT_CID
-                    || !event.sensorSerial
-                    || !this.eventSerials.includes(event.sensorSerial))
-                    continue;
-
-                const media = event.video && event.videoStartedBy
-                    ? event.video[event.videoStartedBy]?._links?.['snapshot/jpg']
-                    : undefined;
-                if (!media)
-                    continue;
-
-                this.cacheSnapshot(media, event.eventTimestamp === undefined
-                    ? undefined
-                    : new Date(event.eventTimestamp > 1_000_000_000_000
-                        ? event.eventTimestamp
-                        : event.eventTimestamp * 1000
-                    )
-                );
-                return
-            }
-            if (pages === 20)
-                break;
-        }
+    private onVideo(event: SimpliSafeEvent): void {
+        const snapshot = event.video?.[this.camera.uuid]?._links?.['snapshot/jpg'];
+        if (snapshot)
+            this.camera.latestSnapshot = {
+                media: snapshot,
+                timestamp: event.eventTimestamp,
+            };
     }
 
     async takePicture(options?: RequestPictureOptions): Promise<MediaObject> {
-        if (!this.snapshot)
+        if (!this.camera.latestSnapshot)
             throw new Error(`No motion snapshot is cached for SimpliSafe camera '${this.camera.name}'.`);
-        return this.createMediaObject(await this.snapshot.fetch(options?.picture), 'image/jpeg');
+        const url = new TemplateUrl(this.camera.latestSnapshot.media.href);
+        return this.createMediaObject(await this.camera.subscription.api.requestBinary(url.render({
+            width: options?.picture?.width,
+            height: options?.picture?.height,
+        }), {
+            headers: {
+                Accept: 'image/jpeg',
+            },
+        }), 'image/jpeg');
     }
 
     async getPictureOptions(): Promise<ResponsePictureOptions[]> {
         return [{
             name: 'Last motion event',
-            canResize: this.snapshot?.url.keys().includes('width'),
-            staleDuration: this.snapshotEventTime ? Math.max(0, Date.now() - this.snapshotEventTime) : undefined,
+            canResize: this.camera.latestSnapshot && new TemplateUrl(this.camera.latestSnapshot.media.href).keys().includes('width'),
+            staleDuration: this.camera.latestSnapshot?.timestamp === undefined
+                ? undefined
+                : Math.max(0, Date.now() - this.camera.latestSnapshot.timestamp * 1000),
         }];
-    }
-
-    private cacheSnapshot(snapshot: SimpliSafeMedia | undefined, timestamp?: Date): void {
-        if (!snapshot)
-            return;
-
-        const eventTime = timestamp?.getTime() ?? Date.now();
-        if (eventTime < this.snapshotEventTime)
-            return;
-        this.snapshot = snapshot;
-        this.snapshotEventTime = eventTime;
     }
 
     clearMotion(): void {
@@ -154,7 +124,7 @@ export class SimpliSafeCameraDevice extends SimpliSafeDevice implements Camera, 
     }
 
     override release(): void {
-        super.release();
         this.clearMotion();
+        super.release();
     }
 }

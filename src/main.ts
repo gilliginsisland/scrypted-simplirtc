@@ -14,8 +14,6 @@ import { SimpliSafeCameraDevice } from './camera';
 import {
     SimpliSafeApi,
     SimpliSafeAuth,
-    SimpliSafeRealtimeEvents,
-    SimpliSafeRealtimeWatchdog,
     type SimpliSafeCamera,
     type SimpliSafeTokenState,
     type SimpliSafeTokenStore,
@@ -97,13 +95,7 @@ export default class SimpliSafePlugin extends ScryptedDeviceBase implements Devi
     });
 
     auth = new SimpliSafeAuth(new StorageTokenStore(this.settingsStorage));
-    api = new SimpliSafeApi(this.auth);
-    private realtimeEvents = new SimpliSafeRealtimeEvents(this.api);
-    private realtimeWatchdog = new SimpliSafeRealtimeWatchdog(this.realtimeEvents, async () => {
-        const userId = await this.api.getUserId();
-        const accessToken = await this.auth.ensureAccessToken();
-        return { accessToken, userId };
-    });
+    api = new SimpliSafeApi(this.auth, this.console);
 
     constructor(nativeId?: string) {
         super(nativeId);
@@ -140,7 +132,6 @@ export default class SimpliSafePlugin extends ScryptedDeviceBase implements Devi
                 return;
             }
 
-            this.console.log(`Refreshing SimpliSafe devices: interface=${refreshInterface} userInitiated=${userInitiated}`);
             await this.api.update();
 
             const cameras = new Map<string, SimpliSafeCamera>();
@@ -174,7 +165,6 @@ export default class SimpliSafePlugin extends ScryptedDeviceBase implements Devi
             );
 
             await deviceManager.onDevicesChanged({ devices });
-            this.console.log(`Discovered ${devices.length} supported SimpliSafe camera(s).`);
         })().finally(
             () => this.refreshPromise = undefined
         );
@@ -193,12 +183,8 @@ export default class SimpliSafePlugin extends ScryptedDeviceBase implements Devi
             const camera = this.cameras.get(nativeId);
             if (!camera)
                 throw new Error(`Unknown SimpliSafe camera nativeId=${nativeId}.`);
-            const device = new SimpliSafeCameraDevice(this.api, this.realtimeEvents, nativeId, camera);
+            const device = new SimpliSafeCameraDevice(nativeId, camera);
             this.devices.set(nativeId, device);
-            void device.primeSnapshot().catch(error => {
-                this.console.warn(`Failed to prime motion snapshot for SimpliSafe camera '${camera.name}'.`, error);
-            });
-            await this.syncRealtimeWatchdog();
         }
         return this.devices.get(nativeId)!;
     }
@@ -210,15 +196,8 @@ export default class SimpliSafePlugin extends ScryptedDeviceBase implements Devi
 
         device.release();
         this.devices.delete(nativeId);
-        await this.syncRealtimeWatchdog();
     }
 
-    private async syncRealtimeWatchdog(): Promise<void> {
-        if (this.realtimeEvents.hasListeners())
-            await this.realtimeWatchdog.start();
-        else
-            this.realtimeWatchdog.stop();
-    }
 }
 
 function asString(value: unknown): string | undefined {

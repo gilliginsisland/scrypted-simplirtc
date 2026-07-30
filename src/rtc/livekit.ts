@@ -75,7 +75,7 @@ export class LiveKitSignaling implements AsyncIterable<LiveKitSignalMessage> {
     }
 
     constructor(ws: WebSocket) {
-        this.messageStream = createWebSocketStream(ws, { readableObjectMode: true });
+        this.messageStream = createWebSocketStream(ws);
         this.messageStream.on('end', () => void this.close());
         this.messageStream.on('error', () => void this.close());
     }
